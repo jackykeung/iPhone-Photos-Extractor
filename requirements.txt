@@ -1,0 +1,2 @@
+# Optional — adds a progress bar. The extractor works without it.
+tqdm>=4.0
