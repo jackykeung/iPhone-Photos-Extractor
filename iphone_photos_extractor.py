@@ -6,12 +6,13 @@ Extract photos/videos from an UNENCRYPTED Apple iPhone (Finder/iTunes) backup,
 preserving original filenames, real creation/modification dates, and EXIF —
 1:1, bit-identical raw copies.
 
-Derived from the algorithm used by joz-k/ios_backup_extractor (Perl), rebuilt
-in clean, auditable, dependency-light Python with performance and robustness
-improvements. Independent tool; not a fork.
+Algorithm follows the approach pioneered by an existing open-source
+iPhone-backup photo extractor, rebuilt in clean, auditable,
+dependency-light Python with performance and robustness improvements.
+Independent tool; not a fork.
 
-What it does / improves over the Perl reference:
-  * PARALLEL copy (ProcessPoolExecutor) — Perl copies one file at a time.
+What it does / improves over the original extractor:
+  * PARALLEL copy (ProcessPoolExecutor) — the original copies one file at a time.
   * Real-filename recovery for iCloud-origin assets (reads the asset UUID ->
     originalFilename map in Photos.sqlite) so you don't get UUID-named files.
   * Album organization via dynamic discovery of Apple's CoreData junction
@@ -139,7 +140,7 @@ def fmt_dt(unix_ts):
 # ---------------------------------------------------------------------------
 # The Manifest.db 'Files' table stores a 'file' blob: a binary plist whose
 # *$objects* contains 'Birth' and 'LastModified' keys mapping to NSDate values.
-# The Perl reference parses the whole object graph. We do a minimal scan for
+# The original extractor parses the whole object graph. We do a minimal scan for
 # the two doubles we need, which is far cheaper at tens of thousands of files.
 
 def _parse_bplist_dates(data):
@@ -222,7 +223,7 @@ def load_icloud_filename_map(photos_db: Path):
     The real filename lives in the asset's ZEXTENDEDATTRIBUTES (a bplist with
     'com.apple.assetsd.originalFilename'). We join
     ZASSET.Z_PK -> ZEXTENDEDATTRIBUTES.ZASSET to recover the filename for each
-    UUID, which is exactly the containment the Perl reference uses. We also
+    UUID, which is exactly the containment the original extractor uses. We also
     fall back to any direct ZFILENAME column that isn't itself a UUID.
     """
     mapping = {}

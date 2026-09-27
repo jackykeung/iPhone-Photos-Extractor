@@ -5,8 +5,8 @@ preserving **original filenames**, **real creation/modification dates**, and **E
 bit-identical raw copies, no re-encoding, no quality loss.
 
 Built in clean, auditable, dependency-light Python (stdlib only, `tqdm` optional). Independent
-tool; the algorithm follows the approach pioneered by `joz-k/ios_backup_extractor` (Perl), rebuilt
-and improved.
+tool; the algorithm follows the approach pioneered by an existing open-source iPhone-backup
+photo extractor, rebuilt and improved.
 
 ---
 
@@ -17,9 +17,9 @@ original filename (`IMG_1234.HEIC`) lives in the DCIM path, and the metadata (EX
 lives *inside* the file itself. So a true 1:1 extraction is just: **copy the bytes + restore the
 file's real Birth & LastModified timestamps**. That's exactly what this does.
 
-## Improvements over the Perl reference
+## Improvements over the original extractor
 
-| Capability | Perl reference | This tool |
+| Capability | Original | This tool |
 |---|---|---|
 | Copy parallelism | Serial (one file at a time) | **Parallel** via `ProcessPoolExecutor` (`--workers`) |
 | Sparse handling | n/a | **Race-safe SHA-256 dedupe** with atomic `O_CREAT\|O_EXCL` markers |
