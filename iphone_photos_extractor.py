@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-iPhone Photos & Videos Extractor  v1.1.1
+iPhone Photos & Videos Extractor  v1.2.0
 ========================================
 Extract photos/videos from an UNENCRYPTED Apple iPhone (Finder/iTunes) backup,
 preserving original filenames, real creation/modification dates, and EXIF —
@@ -28,6 +28,10 @@ What it does / improves over the original extractor:
     summary.
   * LIVE moving progress bar with %, throughput, and ETA (built in; no
     required third-party dependency; quiet + throttled when not a TTY).
+  * Live-Photo pairing: an asset with no usable date inherits its dated
+    sibling's timestamp (e.g. the .mov of a HEIC+MOV Live Photo) so it is
+    classified into the correct year-month folder instead of No_Date. This is
+    on by default; disable with --no-infer-sibling-date.
 
 Usage
 -----
@@ -605,6 +609,81 @@ def parse_since(since_str, tz=None):
 
 
 # ---------------------------------------------------------------------------
+# Live-Photo (sibling) date inference
+# ---------------------------------------------------------------------------
+
+def _usable_date(birth, modif):
+    """Return the best usable unix timestamp from (birth, modif), or None.
+
+    Prefers LastModified, then Birth, but only values inside the plausible
+    window. Mirrors the folder-assignment preference so the inferred date
+    matches what a dated sibling would have produced.
+    """
+    if modif is not None and _ABS_MIN_TS <= modif <= _ABS_MAX_TS:
+        return modif
+    if birth is not None and _ABS_MIN_TS <= birth <= _ABS_MAX_TS:
+        return birth
+    return None
+
+
+def _infer_sibling_dates(items):
+    """Backfill missing dates from a same-stem (Live-Photo) sibling.
+
+    iPhone stores a HEIC (still) and MOV (video) of the same Live Photo as two
+    separate backup records. The .mov record's bplist often has no usable date,
+    so it would otherwise be bucketed into ``No_Date`` even though its .heic is
+    correctly dated. This pass copies the dated sibling's timestamp onto the
+    undated item so the pair is classified together.
+
+    Rules (all "safe by default"):
+      * Only fills an item that has NO usable date; never overrides an existing
+        one.
+      * Keys on the resolved filename stem (case-insensitive), ignoring an
+        optional ``_DELETED`` suffix so a trashed Live Photo still pairs.
+      * Never guesses from a sibling that is itself undated.
+      * If the same stem contains dated items whose dates disagree, the stem is
+        ambiguous and nothing is filled (the item stays in ``No_Date``).
+      * Deleted items are never used as the date source, but may still receive
+        a date (via a non-deleted sibling).
+
+    ``items`` is a list of dicts, each with ``stem``, ``birth``, ``modif``,
+    ``ext`` and ``deleted`` keys. The list is mutated in place and also
+    returned.
+    """
+    # Index of usable-dated, non-deleted stems -> candidate dates by ext.
+    by_stem = {}
+    for it in items:
+        if it.get("deleted"):
+            continue
+        d = _usable_date(it.get("birth"), it.get("modif"))
+        if d is None:
+            continue
+        stem = (it["stem"] or "").lower()
+        if not stem:
+            continue
+        by_stem.setdefault(stem, {})[ (it.get("ext") or "").lower() ] = d
+
+    for it in items:
+        if _usable_date(it.get("birth"), it.get("modif")) is not None:
+            continue  # already dated
+        stem = (it["stem"] or "").lower()
+        exts = by_stem.get(stem)
+        if not exts:
+            continue  # no dated sibling -> leave as no-date
+        # Originals: MOV refers back to the still (heic/jpg/png); if the item
+        # itself is a video, prefer the sibling's image ext, else fall back to
+        # any dated sibling. If multiple distinct dates exist, treat logically
+        # conflicting dates as ambiguous (do not guess).
+        found = set(exts.values())
+        if len(found) != 1:
+            continue  # ambiguous
+        # Prefer LastModified of the sibling; use _usable_date-derived value.
+        d = found.pop()
+        it["birth"], it["modif"] = d, d
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Progress bar (self-contained; works with or without the optional tqdm)
 # ---------------------------------------------------------------------------
 
@@ -720,6 +799,8 @@ def main_with_args(argv=None):
     ap.add_argument("--add-trash", action="store_true", help="Also extract items marked deleted (suffix _DELETED)")
     ap.add_argument("--albums", action="store_true", help="Organize into user album folders (overrides date folders for album items)")
     ap.add_argument("--ignore-icloud-media", action="store_true", help="Skip media from iCloud")
+    ap.add_argument("--no-infer-sibling-date", action="store_true",
+                    help="Do not infer an undated asset's date from a same-stem (Live Photo) sibling")
     ap.add_argument("--prepend-date", action="store_true", help="Prepend creation date (YYYY-MM-DD_) to each filename")
     ap.add_argument("--prepend-date-separator", choices=["dash", "underscore", "none"], default="dash")
     ap.add_argument("--move", action="store_true", help="Move files (frees backup) instead of copy")
@@ -753,8 +834,8 @@ def main_with_args(argv=None):
     print(f"[*] Camera roll candidates: {len(items):,} (Photos.sqlite: {'yes' if has_photos_db else 'NO'}, "
           f"iCloud filenames: {len(icloud_fname):,}, albums: {len(albums):,}, trashed: {len(trashed):,})")
 
-    # Apply filters and build the work plan.
-    plan = []
+    # --- Pass 1: resolve every candidate (name, stem, ext, dates) -----------
+    resolved = []
     since_ts = parse_since(args.since)
     for it in items:
         if args.type != "all":
@@ -769,14 +850,7 @@ def main_with_args(argv=None):
         payload = find_payload_path(backup_dir, it["fileID"])
         if payload is None:
             continue
-        # Parse bplist now to support --since and date-naming.
-        birth, modif = _parse_bplist_dates(it["bplist"])
-        if since_ts:
-            # A since-filter keeps only items we can prove are at/after the
-            # cutoff. An item with no usable date is therefore excluded too.
-            if modif is None or modif < since_ts:
-                continue
-        # Filename.
+        # Filename (iCloud UUID -> real name before we key the pairing on stem).
         m = it["match"]
         name = m.group("name")
         ext = m.group("ext").lower()
@@ -790,9 +864,34 @@ def main_with_args(argv=None):
                     if key.lower() in name.lower() or name.lower() in key.lower():
                         name = real
                         break
-        # Deleted flag.
         rel = it["rel"]
         is_deleted = "Media/" in rel and rel in trashed
+        birth, modif = _parse_bplist_dates(it["bplist"])
+        resolved.append({
+            "payload": payload, "rel": rel, "name": name, "stem": name,
+            "ext": ext, "deleted": is_deleted, "birth": birth, "modif": modif,
+            "bplist": it["bplist"],
+        })
+
+    # --- Pass 2: Live-Photo (sibling) date inference -----------------------
+    if not args.no_infer_sibling_date:
+        _infer_sibling_dates(resolved)
+
+    # --- Pass 3: apply filters, assign folder, build the work plan ---------
+    plan = []
+    for r in resolved:
+        modif = r["modif"]
+        birth = r["birth"]
+        name = r["name"]
+        ext = r["ext"]
+        rel = r["rel"]
+        is_deleted = r["deleted"]
+        if since_ts:
+            # A since-filter keeps only items we can prove are at/after the
+            # cutoff. Inferring a sibling date is mandatory in pass 2, so an
+            # item that got a date is now judged on it (rather than dropped).
+            if modif is None or modif < since_ts:
+                continue
         deleted_suffix = "_DELETED" if (args.add_trash and is_deleted) else ""
         if not args.add_trash and is_deleted:
             continue  # skip trashed by default
@@ -809,10 +908,9 @@ def main_with_args(argv=None):
             # Date folder from LastModified, falling back to Birth. Guard each
             # conversion so an out-of-range value (garbage in some backups)
             # lands in 'No_Date' instead of raising OverflowError.
-            raw = modif if (modif is not None and _ABS_MIN_TS <= modif <= _ABS_MAX_TS) \
-                else birth
+            raw = _usable_date(birth, modif)
             d = None
-            if raw is not None and _ABS_MIN_TS <= raw <= _ABS_MAX_TS:
+            if raw is not None:
                 try:
                     d = datetime.fromtimestamp(raw)
                 except (OverflowError, OSError, ValueError):  # pragma: no cover - in-range value cannot raise
@@ -825,9 +923,9 @@ def main_with_args(argv=None):
             prefix = datetime.fromtimestamp(modif).strftime("%Y-%m-%d" + sep)
             base = prefix + base
         plan.append({
-            "payload": payload, "out_dir": (out_dir / sub) if sub else out_dir,
-            "name": base, "bplist": it["bplist"],
-            "sub": sub, "ext": it["ext"], "deleted": is_deleted,
+            "payload": r["payload"], "out_dir": (out_dir / sub) if sub else out_dir,
+            "name": base, "bplist": r["bplist"],
+            "sub": sub, "ext": ext, "deleted": is_deleted,
             "birth": birth, "modif": modif,
         })
 

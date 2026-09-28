@@ -576,6 +576,143 @@ def test_cli_ignore_icloud(backup, tmp_path):
     assert not list(out.rglob("IMG_0003*"))
 
 
+# ---------------------------------------------------------------------------
+# Live-Photo sibling (date) pairing
+# ---------------------------------------------------------------------------
+
+def test_pairing_mov_follows_dated_heic(backup, tmp_path):
+    """A no-date .mov inherits its dated .heic sibling's month folder."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out)])
+    heic = list(out.rglob("IMG_0020.heic"))
+    mov = list(out.rglob("IMG_0020.mov"))
+    assert heic, "IMG_0020.heic should be present"
+    assert mov, "IMG_0020.mov should be present (paired out of No_Date)"
+    assert mov[0].parent.name == heic[0].parent.name == "2026-04"
+    assert not list((out / "No_Date").glob("IMG_0020.*"))
+
+
+def test_pairing_garbage_date_inherits_sibling(backup, tmp_path):
+    """A .mov whose only date is a garbage double inherits the dated sibling."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out)])
+    mov = list(out.rglob("IMG_0021.mov"))
+    assert mov, "IMG_0021.mov should be paired"
+    assert mov[0].parent.name == "2026-05"
+    assert not list((out / "No_Date").glob("IMG_0021.*"))
+
+
+def test_pairing_orphan_stays_no_date(backup, tmp_path):
+    """An undated .mov with no dated sibling is NOT guessed -> stays in No_Date."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out)])
+    mov = list((out / "No_Date").glob("IMG_0022.*"))
+    assert mov, "IMG_0022.mov (orphan) should remain in No_Date"
+    assert mov[0].name == "IMG_0022.mov"
+
+
+def test_pairing_ambiguous_no_guess(backup, tmp_path):
+    """Two dated siblings with differing dates -> do not guess -> No_Date."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out)])
+    mov = list((out / "No_Date").glob("IMG_0023.*"))
+    assert mov, "IMG_0023.mov (ambiguous) should stay in No_Date"
+    assert mov[0].name == "IMG_0023.mov"
+
+
+def test_pairing_since_keeps_paired_late(backup, tmp_path):
+    """--since judges an undated item on its INFERRED date, not as no-date."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out), "--since", "2026-03-01"])
+    # IMG_0020 pair is dated 2026-04-12 (>= cutoff) so both survive the filter.
+    heic = list(out.rglob("IMG_0020.heic"))
+    mov = list(out.rglob("IMG_0020.mov"))
+    assert heic and mov, "both IMG_0020 members should pass the since filter"
+    # The orphan (no date, no sibling) is excluded by the since filter.
+    assert not list(out.rglob("IMG_0022.*"))
+
+
+def test_pairing_disabled_via_flag(backup, tmp_path):
+    """--no-infer-sibling-date disables pairing -> MOV stays in No_Date."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out), "--no-infer-sibling-date"])
+    heic = list(out.rglob("IMG_0020.heic"))
+    mov = list((out / "No_Date").glob("IMG_0020.*"))
+    assert heic, "IMG_0020.heic present"
+    assert mov, "with pairing disabled, IMG_0020.mov lands in No_Date"
+
+
+def test_pairing_icloud_resolved_stem(backup, tmp_path):
+    """Two iCloud UUIDs resolving to the same real stem pair correctly."""
+    out = tmp_path / "out"
+    p.main_with_args(["--backup", str(backup), "-o", str(out)])
+    heic = list(out.rglob("IMG_0024.heic"))
+    mov = list(out.rglob("IMG_0024.mov"))
+    assert heic, "IMG_0024.heic (iCloud) present"
+    assert mov, "IMG_0024.mov (iCloud) paired out of No_Date"
+    assert mov[0].parent.name == heic[0].parent.name == "2026-07"
+    assert not list((out / "No_Date").glob("IMG_0024.*"))
+
+
+def test_infer_sibling_dates_unit():
+    """Direct unit test of the pairing helper."""
+    HEIC = 1167609600 + 60 * 86400  # a plausible 2007 date
+    items = [
+        # dated image + undated video of the same stem -> video inherits
+        {"stem": "IMG_A", "ext": "heic", "deleted": False, "birth": HEIC, "modif": HEIC},
+        {"stem": "IMG_A", "ext": "mov", "deleted": False, "birth": None, "modif": None},
+        # already-dated item must NOT be overridden
+        {"stem": "IMG_B", "ext": "png", "deleted": False, "birth": HEIC, "modif": None},
+        {"stem": "IMG_B", "ext": "mov", "deleted": False, "birth": HEIC + 5000, "modif": None},
+        # orphan (no dated sibling) stays undated
+        {"stem": "IMG_C", "ext": "mov", "deleted": False, "birth": None, "modif": None},
+        # a deleted item is never a date source, but can be filled
+        {"stem": "IMG_D", "ext": "heic", "deleted": False, "birth": HEIC, "modif": HEIC},
+        {"stem": "IMG_D", "ext": "mov", "deleted": True, "birth": None, "modif": None},
+    ]
+    p._infer_sibling_dates(items)
+    # IMG_A mov inherits
+    assert items[1]["modif"] == HEIC and items[1]["birth"] == HEIC
+    # IMG_B mov already dated -> not overridden
+    assert items[3]["modif"] is None and items[3]["birth"] == HEIC + 5000
+    # IMG_C orphan stays undated
+    assert items[4]["birth"] is None and items[4]["modif"] is None
+    # IMG_D deleted mov filled from non-deleted heic
+    assert items[6]["modif"] == HEIC
+
+
+def test_infer_sibling_dates_ambiguous():
+    """Differing dated siblings for one stem -> the undated item is not filled."""
+    HEIC = 1167609600 + 60 * 86400
+    OTHER = 1167609600 + 90 * 86400
+    items = [
+        {"stem": "IMG_E", "ext": "heic", "deleted": False, "birth": HEIC, "modif": HEIC},
+        {"stem": "IMG_E", "ext": "jpg", "deleted": False, "birth": OTHER, "modif": OTHER},
+        {"stem": "IMG_E", "ext": "mov", "deleted": False, "birth": None, "modif": None},
+    ]
+    p._infer_sibling_dates(items)
+    assert items[2]["birth"] is None and items[2]["modif"] is None
+
+
+def test_infer_no_sibling_is_noop():
+    """No dated sibling at all -> nothing changes."""
+    items = [{"stem": "IMG_X", "ext": "mov", "deleted": False, "birth": None, "modif": None}]
+    p._infer_sibling_dates(items)
+    assert items[0]["birth"] is None and items[0]["modif"] is None
+
+
+def test_infer_ignores_empty_stem():
+    """A dated item with an empty stem is skipped when building the index."""
+    HEIC = 1167609600 + 60 * 86400
+    items = [
+        {"stem": "", "ext": "heic", "deleted": False, "birth": HEIC, "modif": HEIC},
+        {"stem": "IMG_Z", "ext": "mov", "deleted": False, "birth": None, "modif": None},
+    ]
+    p._infer_sibling_dates(items)
+    # The undated IMG_Z has no usable sibling (the empty stem went nowhere).
+    assert items[1]["birth"] is None and items[1]["modif"] is None
+
+
 def test_cli_dedupe(backup, tmp_path):
     out = tmp_path / "out"
     p.main_with_args(["--backup", str(backup), "-o", str(out), "--dedupe"])

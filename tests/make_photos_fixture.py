@@ -174,6 +174,67 @@ def build_fixture(root=None, db_dir=None):
                   "data": b"album-heic", "uuid": None, "fn": "IMG_0012",
                   "album": "Trip"})
 
+    # 13) Live-Photo pairing: a dated HEIC + a no-date MOV sharing the stem.
+    #     The MOV must inherit the HEIC's date instead of landing in No_Date.
+    fid13 = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0020.HEIC",
+                     make_bplist_dates(_epoch(2026, 4, 12, 9, 30, 0),
+                                       _epoch(2026, 4, 12, 9, 30, 0)))
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0020.HEIC", "fid": fid13,
+                  "data": b"pair-heic", "uuid": None, "fn": "IMG_0020"})
+    fid13b = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0020.MOV",
+                      make_bplist_dates())  # no date -> should pair to HEIC
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0020.MOV", "fid": fid13b,
+                  "data": b"pair-mov", "uuid": None, "fn": "IMG_0020"})
+
+    # 14) Live-Photo pairing with a GARBAGE date in the MOV only.
+    fid14 = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0021.HEIC",
+                     make_bplist_dates(_epoch(2026, 5, 1, 12, 0, 0),
+                                       _epoch(2026, 5, 1, 12, 0, 0)))
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0021.HEIC", "fid": fid14,
+                  "data": b"pair2-heic", "uuid": None, "fn": "IMG_0021"})
+    fid14b = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0021.MOV",
+                      make_bplist_dates(GARBAGE_DOUBLE, GARBAGE_DOUBLE))
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0021.MOV", "fid": fid14b,
+                  "data": b"pair2-mov", "uuid": None, "fn": "IMG_0021"})
+
+    # 15) An orphan MOV with no date and NO dated sibling -> stays in No_Date.
+    fid15 = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0022.MOV",
+                     make_bplist_dates())
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0022.MOV", "fid": fid15,
+                  "data": b"orphan-mov", "uuid": None, "fn": "IMG_0022"})
+
+    # 16) Ambiguous pairing: the same stem has two dated siblings with DIFFERENT
+    #     dates; the no-date MOV must not be guessed -> stays in No_Date.
+    fid16 = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0023.HEIC",
+                     make_bplist_dates(_epoch(2026, 6, 1, 0, 0, 0),
+                                       _epoch(2026, 6, 1, 0, 0, 0)))
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0023.HEIC", "fid": fid16,
+                  "data": b"amb-heic", "uuid": None, "fn": "IMG_0023"})
+    fid16b = _add_row(rows, DOMAIN, "Media/DCIM/101APPLE/IMG_0023.JPG",
+                      make_bplist_dates(_epoch(2026, 6, 2, 0, 0, 0),
+                                        _epoch(2026, 6, 2, 0, 0, 0)))
+    media.append({"rel": "Media/DCIM/101APPLE/IMG_0023.JPG", "fid": fid16b,
+                  "data": b"amb-jpg", "uuid": None, "fn": "IMG_0023"})
+    fid16c = _add_row(rows, DOMAIN, "Media/DCIM/100APPLE/IMG_0023.MOV",
+                      make_bplist_dates())
+    media.append({"rel": "Media/DCIM/100APPLE/IMG_0023.MOV", "fid": fid16c,
+                  "data": b"amb-mov", "uuid": None, "fn": "IMG_0023"})
+
+    # 17) iCloud Live-Photo pair: two UUID CPLAssets resolving to the same stem.
+    uuid17h = "CCCCCCCC-3333-4444-5555-666666666666"
+    uuid17m = "DDDDDDDD-4444-5555-6666-777777777777"
+    fid17h = _add_row(rows, DOMAIN, f"Media/PhotoData/CPLAssets/group103/{uuid17h}.HEIC",
+                      make_bplist_dates(_epoch(2026, 7, 1, 0, 0, 0),
+                                        _epoch(2026, 7, 1, 0, 0, 0)))
+    media.append({"rel": f"Media/PhotoData/CPLAssets/group103/{uuid17h}.HEIC",
+                  "fid": fid17h, "data": b"icloud-pair-heic", "uuid": uuid17h,
+                  "fn": "IMG_0024"})
+    fid17m = _add_row(rows, DOMAIN, f"Media/PhotoData/CPLAssets/group103/{uuid17m}.MOV",
+                      make_bplist_dates())
+    media.append({"rel": f"Media/PhotoData/CPLAssets/group103/{uuid17m}.MOV",
+                  "fid": fid17m, "data": b"icloud-pair-mov", "uuid": uuid17m,
+                  "fn": "IMG_0024"})
+
     # --- Write the payload files ---
     payloads = {}
     for m in media:

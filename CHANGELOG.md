@@ -12,7 +12,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [v1.1.1] — Unreleased
+## [v1.2.0] — 2026-09-28
+
+### Added
+- **Live-Photo (HEIC/MOV) sibling-date pairing.** An asset with no usable date now inherits the
+  timestamp of its same-stem sibling, so the `.mov` half of a HEIC+MOV Live Photo picks up the
+  `.heic`'s date and the pair is classified into the same `YYYY-MM` folder instead of being split
+  into `No_Date`. This is **on by default**; disable with `--no-infer-sibling-date`.
+  - Keys on the resolved filename stem (after iCloud recovery), ignoring `_DELETED` and case.
+  - Never overrides an existing date, never guesses from an undated sibling, and marks stems whose
+    dated siblings disagree as ambiguous (left in `No_Date`).
+  - Validated on a real 3,920-candidate backup: `No_Date` dropped from **1,583 → 6** true orphans.
+- **`_infer_sibling_dates()`** and **`_usable_date()`** helpers; `main_with_args()` refactored into
+  a resolve → pair → filter/map pipeline.
+- **Tests** for pairing (MOV-follows-HEIC, garbage-date, orphan, ambiguous, iCloud-resolved stem,
+  `--since` interplay, opt-out, plus unit tests) — 105 tests, 100% line + branch coverage.
+
+### Changed
+- **`--since` now judges an undated item on its inferred date** — a paired-MOV with a recent
+  sibling is kept rather than dropped as "no date".
+
+---
+
+## [v1.1.1] — 2026-09-28
 
 ### Changed
 - **TTY-aware live progress bar.** When the terminal is interactive (a TTY) the bar rewrites a

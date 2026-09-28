@@ -79,6 +79,7 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 | `--albums` | Organize into your real user photo albums |
 | `--add-trash` | Also extract items marked deleted (suffix `_DELETED`) |
 | `--ignore-icloud-media` | Skip media sourced from iCloud |
+| `--no-infer-sibling-date` | Don't infer an undated asset's date from a same-stem (Live Photo) sibling (**default on**) |
 | `--prepend-date` | Prepend creation date (`YYYY-MM-DD_`) to each filename |
 | `--move` | Move files out of the backup (frees disk) instead of copy |
 | `--dedupe` | Skip identical content (SHA-256, race-safe) |
@@ -95,7 +96,10 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
    newest schema (`ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME`, iOS 18+), then the older
    `ZEXTENDEDATTRIBUTES` bplist (`com.apple.assetsd.originalFilename`), then `ZFILENAME` as a fallback.
 3. **Organize** into user albums (via dynamic discovery of the CoreData album↔asset junction table)
-   or `YYYY-MM`/`YYYY-MM-DD` folders by the file's real LastModified/Birth.
+   or `YYYY-MM`/`YYYY-MM-DD` folders by the file's real LastModified/Birth. An asset with **no
+   usable date** (common for the `.mov` half of a HEIC+MOV **Live Photo**) first **inherits the
+   timestamp of its same-stem sibling**, so the pair is classified together instead of being
+   split into `No_Date`. Truly-unpaired files still fall back to `No_Date` (never guessed).
 4. **Restore dates** by parsing the manifest's binary-plist `Birth`/`LastModified` and applying them
    (`/usr/bin/SetFile` on macOS, `utime` fallback).
 5. **Copy in parallel**, with atomic SHA-256 dedupe and full incremental resume.
@@ -105,7 +109,17 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 ## Changelog
 
 The full, dated, versioned release history lives in **[CHANGELOG.md](CHANGELOG.md)** (Keep a
-Changelog / SemVer). The current release is **v1.1.1**.
+Changelog / SemVer). The current release is **v1.2.0**.
+
+### v1.2.0
+- **Live-Photo (HEIC/MOV) sibling-date pairing** — an asset with no usable date now inherits the
+  timestamp of its same-stem sibling (the `.mov` of a HEIC+MOV Live Photo picks up the `.heic`'s
+  date), so pairs are classified into the correct `YYYY-MM` folder instead of being split into
+  `No_Date`. On by default; disable with `--no-infer-sibling-date`. Truly-unpaired files (no dated
+  sibling) still fall back to `No_Date` — never guessed. Validated on Stanley's backup (3,920
+  candidates): `No_Date` dropped from **1,583 → 6** true orphans.
+- **`--since` now judges an undated item on its inferred date** (a paired-MOV with a recent sibling
+  is kept rather than dropped).
 
 ### v1.1.1
 - **TTY-aware live progress bar** — when piped to a file/log (not a terminal) it now emits a
