@@ -1,2 +1,6 @@
-# Optional — adds a progress bar. The extractor works without it.
-tqdm>=4.0
+# The extractor is stdlib-only — no runtime dependencies required.
+#
+# This file is intentionally left empty. There is nothing to install to run
+# `iphone_photos_extractor.py`.
+#
+# For development/testing only, see requirements-dev.txt (pytest, coverage).

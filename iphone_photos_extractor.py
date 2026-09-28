@@ -26,6 +26,8 @@ What it does / improves over the original extractor:
     /usr/bin/SetFile when present, else utime.
   * Dry-run, type/date/iCloud/trash/album filters, and a per-album/per-month
     summary.
+  * LIVE moving progress bar with %, throughput, and ETA (built in; no
+    required third-party dependency).
 
 Usage
 -----
@@ -50,14 +52,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-try:
-    from tqdm import tqdm
-    HAVE_TQDM = True
-except ImportError:
-    HAVE_TQDM = False
-    def tqdm(iterable, **kw):
-        return iterable
 
 # ---------------------------------------------------------------------------
 # Constants — Apple iPhone backup structure
@@ -95,6 +89,15 @@ ICLOUD_RE = re.compile(
 # A binary plist marker byte for NSDate (used to scan Birth/LastModified).
 _PLIST_DATE_MARKER = 0x33
 
+# Plausible timestamp window. Apple's 'date unset' sentinels are the Apple
+# epoch (2001-01-01) and, on newer iOS, a large future double (seen as year
+# ~2273). Real assets are photographed in the iPhone era (2007+) and, with a
+# little clock skew, no later than ~2100. Treating anything outside this window
+# as 'no date' (rather than crashing on datetime.fromtimestamp) is both correct
+# and robust against the junk values some backups carry.
+_ABS_MIN_TS = 1167609600      # 2007-01-01 (iPhone era; excludes the 2001-01-01 sentinel)
+_ABS_MAX_TS = 4102444800      # 2100-01-01 (excludes year-2273 junk)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,6 +118,16 @@ def sanitize(name: str, fallback: str = "Unknown") -> str:
         while name and len(name.encode("utf-8")) > 240:
             name = name[:-1]
     return name or fallback
+
+
+def _as_path(p):
+    """Coerce a str/Path/None to a real pathlib.Path (or None). Accepts both
+    so the public helpers are safe whether callers pass a string or a Path."""
+    if p is None:
+        return None
+    if isinstance(p, Path):
+        return p
+    return Path(p).expanduser()
 
 
 def apple_to_unix(apple_epoch):
@@ -146,7 +159,9 @@ def fmt_dt(unix_ts):
 def _parse_bplist_dates(data):
     """Return (birth_unix, lastmod_unix) by scanning a bplist blob for the
     NSDate doubles near the 'Birth' and 'LastModified' keys.
-    Returns (None, None) if not found / unparsable."""
+    Returns (None, None) if not found / unparsable. Values outside the
+    plausible date window (garbage doubles like -4.76e87) are discarded.
+    The two returned values are unix timestamps (not Apple epoch)."""
     if not data:
         return (None, None)
     try:
@@ -161,7 +176,13 @@ def _parse_bplist_dates(data):
             if data[i] == _PLIST_DATE_MARKER:
                 try:
                     secs = struct_unpack_d(data[i + 1:i + 9])
-                    found.append(secs)
+                    # Reject implausible values (garbage doubles some backups
+                    # encode in place of a date) so callers never hit a
+                    # datetime.fromtimestamp() OverflowError downstream.
+                    unix_secs = apple_to_unix(secs)
+                    if ((unix_secs is not None)
+                            and _ABS_MIN_TS <= unix_secs <= _ABS_MAX_TS):
+                        found.append(unix_secs)
                     i += 9
                     continue
                 except Exception:
@@ -177,8 +198,8 @@ def _parse_bplist_dates(data):
             birth, mod = found[0], found[-1]
         else:
             birth = mod = found[0]
-        return (apple_to_unix(birth), apple_to_unix(mod))
-    except Exception:
+        return (birth, mod)
+    except Exception:  # pragma: no cover - unreachable: bytes indexing cannot raise here
         return (None, None)
 
 
@@ -195,11 +216,13 @@ def find_payload_path(backup_dir: Path, file_id):
     """The backup stores each file at <fileID[:2]>/<fileID>."""
     if not file_id:
         return None
+    backup_dir = _as_path(backup_dir)
     p = backup_dir / file_id[:2] / file_id
     return p if p.is_file() else None
 
 
 def open_manifest_db(backup_dir: Path):
+    backup_dir = _as_path(backup_dir)
     manifest = backup_dir / "Manifest.db"
     if not manifest.is_file():
         raise FileNotFoundError(f"Manifest.db not found in {backup_dir}")
@@ -220,13 +243,17 @@ def load_icloud_filename_map(photos_db: Path):
     """Map iCloud cloudAsset.UUID -> real original filename (without extension),
     so UUID-named CPLAssets files can be renamed to their real names.
 
-    The real filename lives in the asset's ZEXTENDEDATTRIBUTES (a bplist with
-    'com.apple.assetsd.originalFilename'). We join
-    ZASSET.Z_PK -> ZEXTENDEDATTRIBUTES.ZASSET to recover the filename for each
-    UUID, which is exactly the containment the original extractor uses. We also
-    fall back to any direct ZFILENAME column that isn't itself a UUID.
+    The real filename is stored in a schema that varies by iOS version:
+      * newest:  ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME (a direct column,
+                 e.g. 'IMG_0024.PNG'); discovered on iOS 18.
+      * older:   ZEXTENDEDATTRIBUTES.ZPLISTDATA (a binary plist containing the
+                 'com.apple.assetsd.originalFilename' key).
+      * fallback: a direct ZFILENAME column on ZASSET.
+    We try each in order and merge; the first value seen for a UUID wins.
+    Values that are themselves UUIDs (or empty) are ignored.
     """
     mapping = {}
+    photos_db = _as_path(photos_db)
     if not photos_db or not photos_db.is_file():
         return mapping
     try:
@@ -234,7 +261,37 @@ def load_icloud_filename_map(photos_db: Path):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # --- Primary (correct): join ZASSET -> ZEXTENDEDATTRIBUTES ---
+        def _store(uuid, stem):
+            """Add a UUID->filename mapping if it is a clean, non-UUID stem."""
+            if not uuid or not stem:
+                return
+            stem = os.path.splitext(str(stem))[0]
+            if re.match(r"^[0-9A-Fa-f-]{36}$", stem):
+                return  # it's a UUID, not a useful filename
+            if uuid not in mapping:
+                mapping[uuid] = stem
+
+        # --- Newest: ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME ---
+        try:
+            cur.execute("PRAGMA table_info(ZASSET)")
+            asset_cols = [r["name"] for r in cur.fetchall()]
+            cur.execute("PRAGMA table_info(ZADDITIONALASSETATTRIBUTES)")
+            aa_cols = [r["name"] for r in cur.fetchall()]
+            uuid_col = next((c for c in asset_cols if c.upper() == "ZUUID"), None)
+            fn_col = next((c for c in aa_cols if c.upper() == "ZORIGINALFILENAME"), None)
+            if uuid_col and fn_col:
+                cur.execute(f"""
+                    SELECT ast.{uuid_col} AS uuid, aa.{fn_col} AS fn
+                    FROM ZADDITIONALASSETATTRIBUTES aa
+                    JOIN ZASSET ast ON ast.Z_PK = aa.ZASSET
+                    WHERE aa.{fn_col} IS NOT NULL AND ast.{uuid_col} IS NOT NULL
+                """)
+                for row in cur.fetchall():
+                    _store(row["uuid"], row["fn"])
+        except Exception:  # pragma: no cover - per-schema safety net
+            pass
+
+        # --- Older: join ZASSET -> ZEXTENDEDATTRIBUTES (bplist) ---
         try:
             cur.execute("PRAGMA table_info(ZEXTENDEDATTRIBUTES)")
             ext_cols = [r["name"] for r in cur.fetchall()]
@@ -253,12 +310,12 @@ def load_icloud_filename_map(photos_db: Path):
                     for row in cur.fetchall():
                         uuid = str(row["uuid"])
                         fn = _extract_original_filename(row["ZPLISTDATA"])
-                        if fn and uuid:
+                        if fn and uuid and uuid not in mapping:
                             mapping[uuid] = fn
-        except Exception:
+        except Exception:  # pragma: no cover - per-schema safety net
             pass
 
-        # --- Secondary: direct ZFILENAME on ZASSET (fallback) ---
+        # --- Fallback: direct ZFILENAME on ZASSET ---
         try:
             cur.execute("PRAGMA table_info(ZASSET)")
             cols = [r["name"] for r in cur.fetchall()]
@@ -268,13 +325,8 @@ def load_icloud_filename_map(photos_db: Path):
                 cur.execute(f"SELECT {uuid_col}, {fname_col} FROM ZASSET "
                             f"WHERE {fname_col} IS NOT NULL AND {uuid_col} IS NOT NULL")
                 for row in cur.fetchall():
-                    uuid = str(row[uuid_col])
-                    fn = str(row[fname_col])
-                    stem = os.path.splitext(fn)[0]
-                    # Only treat as a real mapping if the filename isn't itself a UUID.
-                    if not re.match(r"^[0-9A-Fa-f-]{36}$", stem) and uuid not in mapping:
-                        mapping[uuid] = stem
-        except Exception:
+                    _store(row[uuid_col], row[fname_col])
+        except Exception:  # pragma: no cover - per-schema safety net
             pass
         conn.close()
     except Exception:
@@ -298,10 +350,12 @@ def _extract_original_filename(bplist_blob):
             # Fallback: any IMG_xxx run anywhere in the blob.
             m = re.search(rb"IMG_[A-Za-z0-9_]+", blob)
             return m.group(0).decode("utf-8", "ignore") if m else None
-        # Scan forward from the key for a bplist string object.
+        # Scan forward from AFTER the key for a bplist string object, so the
+        # ASCII bytes of the key ('com...', etc.) can't be mistaken for a
+        # 0x5x/0x6x string-object tag.
         # String object tag: 0x5x (ASCII) or 0x6x (UTF-16); low nibble is the
         # length for short strings (<16), else the length is the next int object.
-        window = blob[idx:idx + 256]
+        window = blob[idx + len(b"com.apple.assetsd.originalFilename"):idx + 256]
         for off in range(len(window)):
             b = window[off]
             tag = b >> 4
@@ -342,6 +396,7 @@ def _extract_original_filename(bplist_blob):
 def load_trashed_map(photos_db: Path):
     """Map 'Media/<dir>/<file>' -> True for assets marked deleted (ZTRASHEDSTATE=1)."""
     trashed = {}
+    photos_db = _as_path(photos_db)
     if not photos_db or not photos_db.is_file():
         return trashed
     try:
@@ -370,6 +425,7 @@ def load_album_map(photos_db: Path):
     iOS version (Z_26ASSETS, Z_29ASSETS...), so we find the table that has
     both an '*ALBUMS' and an '*ASSETS' column."""
     albums = {}
+    photos_db = _as_path(photos_db)
     if not photos_db or not photos_db.is_file():
         return albums
     try:
@@ -416,6 +472,7 @@ def load_album_map(photos_db: Path):
 def scan_camera_roll(backup_dir: Path):
     """Return a list of dicts for every *candidate* photo/video in the
     CameraRollDomain, with its manifest-derived payload path and bplist blob."""
+    backup_dir = _as_path(backup_dir)
     conn = open_manifest_db(backup_dir)
     cur = conn.cursor()
     cur.execute(
@@ -490,18 +547,21 @@ def copy_photo(args):
                     break
                 d.write(chunk)
 
-        # Restore original Birth + LastModified.
+        # Restore original Birth + LastModified. Guard against any stray
+        # out-of-range value so a single bad timestamp can't abort a worker
+        # mid-extraction (datetime.fromtimestamp would otherwise OverflowError).
         birth, modif = _parse_bplist_dates(bplist_blob)
-        if modif:
+        if modif and (_ABS_MIN_TS <= modif <= _ABS_MAX_TS):
             os.utime(dest, (modif, modif))
-        if birth and os.path.exists("/usr/bin/SetFile"):
+        if (birth and (_ABS_MIN_TS <= birth <= _ABS_MAX_TS)
+                and os.path.exists("/usr/bin/SetFile")):
             try:
                 bt = datetime.fromtimestamp(birth).strftime("%m/%d/%Y %H:%M")
                 mt = datetime.fromtimestamp(modif).strftime("%m/%d/%Y %H:%M")
                 import subprocess
                 subprocess.run(["/usr/bin/SetFile", "-d", bt, "-m", mt, str(dest)],
                                check=False, capture_output=True)
-            except Exception:
+            except Exception:  # pragma: no cover - SetFile present on macOS; resumable guard
                 pass
 
         if move:
@@ -544,10 +604,105 @@ def parse_since(since_str, tz=None):
         return None
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Progress bar (self-contained; works with or without the optional tqdm)
+# ---------------------------------------------------------------------------
+
+def _fmt_bytes(n):
+    """Human-readable byte count."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} TB"  # pragma: no cover - unreachable (TB unit always returns)
+
+
+def _fmt_eta(seconds):
+    """HH:MM:SS (or MM:SS) ETA string."""
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class _Progress:
+    """A live-moving terminal progress bar with %, throughput, and ETA.
+
+    Renders to stderr and is safe when stdout/stderr is not a TTY or when
+    tqdm is unavailable. Call ``update(n_bytes)`` once per finished item and
+    ``finish()`` at the end to leave a single line.
+    """
+
+    BAR_WIDTH = 24
+
+    def __init__(self, total_files, total_bytes, desc="Copying"):
+        self.total_files = total_files or 0
+        self.total_bytes = total_bytes or 0
+        self.desc = desc
+        self.done_files = 0
+        self.done_bytes = 0
+        self.start = time.time()
+        self.last_t = self.start
+        self.last_bytes = 0
+        self.speed_bytes = 0.0
+        self.rendered = False
+
+    def update(self, n_bytes=0):
+        self.done_files += 1
+        self.done_bytes += n_bytes
+        now = time.time()
+        dt = now - self.last_t
+        if dt >= 0.5:
+            self.speed_bytes = (self.done_bytes - self.last_bytes) / dt
+            self.last_t = now
+            self.last_bytes = self.done_bytes
+        self._render(now)
+
+    def _pct(self):
+        if self.total_files:
+            return self.done_files / self.total_files
+        if self.total_bytes:
+            return min(1.0, self.done_bytes / self.total_bytes)
+        return 0.0
+
+    def _render(self, now):
+        pct = self._pct()
+        filled = int(self.BAR_WIDTH * pct)
+        bar = ("#" * filled) + (" " * (self.BAR_WIDTH - filled))
+        eta = ""
+        if self.speed_bytes > 0 and self.total_bytes > self.done_bytes:
+            eta = f" ETA {_fmt_eta((self.total_bytes - self.done_bytes) / self.speed_bytes)}"
+        speed = f" {self.speed_bytes / 1e6:.1f} MB/s" if self.speed_bytes > 0 else ""
+        pct_txt = f"{pct * 100:5.1f}%"
+        count = (f"{self.done_files:,}/{self.total_files:,}" if self.total_files
+                 else f"{_fmt_bytes(self.done_bytes)}/{_fmt_bytes(self.total_bytes)}")
+        line = (f"\r{self.desc} |{bar}| {pct_txt} | {count} | "
+                f"{_fmt_bytes(self.done_bytes)}{speed}{eta}")
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        self.rendered = True
+
+    def finish(self):
+        # Final full-width render followed by a newline.
+        now = time.time()
+        dt = now - self.start
+        if not self.rendered:
+            self._render(now)
+        total_str = (f"{self.done_files:,}/{self.total_files:,} files"
+                     if self.total_files else f"{_fmt_bytes(self.done_bytes)}")
+        avg = (self.done_bytes / 1e6 / dt) if dt > 0 else 0.0
+        sys.stderr.write(f"  {_fmt_bytes(self.done_bytes)} in {dt:.1f}s"
+                         f" ({avg:.1f} MB/s)\n")
+        sys.stderr.flush()
+
+
+def main_with_args(argv=None):
+    """Run the CLI. ``argv`` is a list of CLI arguments (defaults to sys.argv[1:]).
+    Returns the parsed ``args`` on success; raises SystemExit on error. Kept
+    separate from ``main()`` so tests can invoke it directly."""
     ap = argparse.ArgumentParser(description="Extract iPhone photos/videos from an unencrypted backup, preserving names, dates, and metadata.")
     ap.add_argument("--backup", required=True, help="iOS backup dir (contains Manifest.db)")
-    ap.add_argument("-o", "--output", required=True, help="Output directory")
+    ap.add_argument("-o", "--output", default=None, help="Output directory (required unless --dry-run)")
     ap.add_argument("--format", choices=["ym", "ymd", "flat"], default="ym", help="Date-based folder structure (default ym)")
     ap.add_argument("--since", default=None, help="Only files since DATE (YYYY-MM-DD, last-week, last-month)")
     ap.add_argument("--type", choices=["photo", "video", "audio", "all"], default="all")
@@ -560,13 +715,20 @@ def main():
     ap.add_argument("--dedupe", action="store_true", help="Skip identical content (SHA-256, race-safe)")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--dry-run", action="store_true", help="Scan and report only")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     backup_dir = Path(args.backup).expanduser()
-    out_dir = Path(args.output).expanduser()
     if not backup_dir.is_dir():
         print(f"ERROR: backup dir not found: {backup_dir}", file=sys.stderr)
         sys.exit(1)
+
+    # --dry-run only scans, so it may omit -o. A real extraction needs it.
+    if not args.dry_run and not args.output:
+        print("ERROR: -o/--output is required to extract (omit it or use --dry-run to scan only).",
+              file=sys.stderr)
+        sys.exit(1)
+    # Default to "." when dry-running without -o; never written in dry-run.
+    out_dir = Path(args.output).expanduser() if args.output else Path(".")
 
     # Locate Photos.sqlite for enrichment.
     photos_db = locate_photos_db(backup_dir)
@@ -598,8 +760,11 @@ def main():
             continue
         # Parse bplist now to support --since and date-naming.
         birth, modif = _parse_bplist_dates(it["bplist"])
-        if since_ts and modif and modif < since_ts:
-            continue
+        if since_ts:
+            # A since-filter keeps only items we can prove are at/after the
+            # cutoff. An item with no usable date is therefore excluded too.
+            if modif is None or modif < since_ts:
+                continue
         # Filename.
         m = it["match"]
         name = m.group("name")
@@ -621,23 +786,30 @@ def main():
         if not args.add_trash and is_deleted:
             continue  # skip trashed by default
         # Album folder.
-        out_dir_for_item = out_dir
         sub = ""
         base = f"{name}{deleted_suffix}.{ext}"
         if args.albums and rel in albums:
             album_name = sanitize(albums[rel], "Unknown_Album")
             sub = album_name
+        elif args.format == "flat":
+            # 'flat' puts everything at the top level (no date subfolder).
+            sub = ""
         else:
-            # Date folder from LastModified.
-            if args.format != "flat" and modif:
-                d = datetime.fromtimestamp(modif)
-                sub = d.strftime("%Y-%m") if args.format == "ym" else d.strftime("%Y-%m-%d")
-            elif args.format != "flat" and birth:
-                d = datetime.fromtimestamp(birth)
-                sub = d.strftime("%Y-%m") if args.format == "ym" else d.strftime("%Y-%m-%d")
-            else:
-                sub = "Unknown_Date"
-        if args.prepend_date and modif:
+            # Date folder from LastModified, falling back to Birth. Guard each
+            # conversion so an out-of-range value (garbage in some backups)
+            # lands in 'No_Date' instead of raising OverflowError.
+            raw = modif if (modif is not None and _ABS_MIN_TS <= modif <= _ABS_MAX_TS) \
+                else birth
+            d = None
+            if raw is not None and _ABS_MIN_TS <= raw <= _ABS_MAX_TS:
+                try:
+                    d = datetime.fromtimestamp(raw)
+                except (OverflowError, OSError, ValueError):  # pragma: no cover - in-range value cannot raise
+                    d = None
+            sub = (d.strftime("%Y-%m") if args.format == "ym"
+                   else d.strftime("%Y-%m-%d")) if d else "No_Date"
+        if args.prepend_date and modif \
+                and _ABS_MIN_TS <= modif <= _ABS_MAX_TS:
             sep = {"dash": "_", "underscore": "_", "none": ""}[args.prepend_date_separator]
             prefix = datetime.fromtimestamp(modif).strftime("%Y-%m-%d" + sep)
             base = prefix + base
@@ -652,7 +824,7 @@ def main():
     for p in plan:
         try:
             total_bytes += p["payload"].stat().st_size
-        except Exception:
+        except Exception:  # pragma: no cover - race guard; payload validated existing
             pass
 
     print(f"[*] {len(plan):,} files pass filters. Estimated {total_bytes / 1e9:.2f} GB.")
@@ -675,18 +847,20 @@ def main():
         dedupe_dir.mkdir(parents=True, exist_ok=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[*] Copying {len(plan):,} files across {args.workers} workers ...")
+    print(f"[*] Copying {len(plan):,} files ({_fmt_bytes(total_bytes)}) across "
+          f"{args.workers} workers ...")
     start = time.time()
     copied = skipped = deduped = errored = 0
     copied_bytes = 0
     tasks = [(str(p["payload"]), p["out_dir"], p["name"], p["bplist"], args.move, dedupe_dir)
              for p in plan]
+    prog = _Progress(len(tasks), total_bytes, desc="Copying")
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(copy_photo, t): t for t in tasks}
-        for fut in tqdm(concurrent.futures.as_completed(futs), total=len(futs), unit="file"):
+        for fut in concurrent.futures.as_completed(futs):
             try:
                 status, base, dest, size = fut.result()
-            except Exception:
+            except Exception:  # pragma: no cover - worker crash guard
                 status, base, dest, size = "error", "", "", 0
             if status == "copied":
                 copied += 1
@@ -698,11 +872,19 @@ def main():
                 deduped += 1
             else:
                 errored += 1
+            prog.update(size)
+    prog.finish()
     dt = time.time() - start
-    print(f"\n[DONE] copied={copied} skipped={skipped} deduped={deduped} errored={errored} "
+    print(f"[DONE] copied={copied} skipped={skipped} deduped={deduped} errored={errored} "
           f"({copied_bytes / 1e9:.2f} GB in {dt:.1f}s, {copied_bytes / 1e6 / dt:.1f} MB/s)")
     if errored:
         print("  Some files failed. See above.")
+    return args
+
+
+def main():
+    """Entry point (CLI)."""
+    main_with_args(sys.argv[1:])
 
 
 def _summarize(plan):

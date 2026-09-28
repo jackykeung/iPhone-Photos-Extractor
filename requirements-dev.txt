@@ -1,0 +1,5 @@
+# Development/test-only dependencies (not required to run the extractor).
+# Install with:  pip install -r requirements-dev.txt
+pytest>=8.0
+coverage>=7.0
+pytest-cov>=5.0
