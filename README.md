@@ -104,6 +104,13 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 
 ## Changelog
 
+The full, dated, versioned release history lives in **[CHANGELOG.md](CHANGELOG.md)** (Keep a
+Changelog / SemVer). The current release is **v1.1.1**.
+
+### v1.1.1
+- **TTY-aware live progress bar** — when piped to a file/log (not a terminal) it now emits a
+  throttled discrete line every ~5 s instead of flooding the capture with one `\r` line per file.
+
 ### v1.1.0
 - **Robust date handling** — birth/modified timestamps are validated against a plausible window
   (Jan 2007 – Jan 2100). Garbage doubles (e.g. year ~2273 / huge floats) and the "date unset"
@@ -119,6 +126,8 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
   optional `tqdm` dependency (runtime is now pure stdlib).
 - **Test suite** — `tests/` with a synthetic-backup fixture generator; **100% line and branch
   coverage** of `iphone_photos_extractor.py` (pytest + coverage — see `requirements-dev.txt`).
+
+Earlier releases: **v1.0.1** (docs) and **v1.0.0** (initial release) — see `CHANGELOG.md`.
 
 ---
 

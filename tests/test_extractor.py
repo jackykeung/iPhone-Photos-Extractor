@@ -433,6 +433,8 @@ def test_sha256_file(tmp_path):
 
 def test_progress_updates(capsys):
     prog = p._Progress(total_files=3, total_bytes=300)
+    # Simulate a real terminal so every update rewrites the live bar (`\r`).
+    prog.tty = True
     prog.update(100)
     prog.update(100)
     prog.update(100)
@@ -458,6 +460,23 @@ def test_progress_by_bytes_when_no_files(capsys):
     prog._render(time.time())
     err = capsys.readouterr().err
     assert "ETA" in err
+
+
+def test_progress_nontty_throttled(capsys):
+    """Piped/logged output: render a discrete line, throttled, not one per file."""
+    prog = p._Progress(total_files=5, total_bytes=500)
+    prog.tty = False
+    prog.next_nontty = 0.0  # render the first line, then back off
+    for _ in range(5):
+        prog.update(100)
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if ln]
+    # The very first update renders; the rest are throttled out on non-TTY.
+    assert len(lines) == 1
+    assert "Copying" in lines[0] and "\r" not in lines[0]  # discrete line, no carriage return
+    # A final finish() leaves a summary line.
+    prog.finish()
+    err = capsys.readouterr().err
+    assert "files" in err or "B" in err
 
 
 # ---------------------------------------------------------------------------

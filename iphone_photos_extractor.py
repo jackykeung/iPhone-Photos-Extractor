@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-iPhone Photos & Videos Extractor  v1.0
-======================================
+iPhone Photos & Videos Extractor  v1.1.1
+========================================
 Extract photos/videos from an UNENCRYPTED Apple iPhone (Finder/iTunes) backup,
 preserving original filenames, real creation/modification dates, and EXIF —
 1:1, bit-identical raw copies.
@@ -27,7 +27,7 @@ What it does / improves over the original extractor:
   * Dry-run, type/date/iCloud/trash/album filters, and a per-album/per-month
     summary.
   * LIVE moving progress bar with %, throughput, and ETA (built in; no
-    required third-party dependency).
+    required third-party dependency; quiet + throttled when not a TTY).
 
 Usage
 -----
@@ -634,6 +634,10 @@ class _Progress:
     """
 
     BAR_WIDTH = 24
+    # When stderr is not a TTY (piped to a file/log), a live `\r` bar would flood
+    # the capture with one line per file. Instead we render a fresh, self-contained
+    # line at most once every NON_TTY_INTERVAL seconds using `\n`.
+    NON_TTY_INTERVAL = 5.0
 
     def __init__(self, total_files, total_bytes, desc="Copying"):
         self.total_files = total_files or 0
@@ -646,6 +650,8 @@ class _Progress:
         self.last_bytes = 0
         self.speed_bytes = 0.0
         self.rendered = False
+        self.tty = sys.stderr.isatty() if hasattr(sys.stderr, "isatty") else False
+        self.next_nontty = self.start
 
     def update(self, n_bytes=0):
         self.done_files += 1
@@ -656,7 +662,10 @@ class _Progress:
             self.speed_bytes = (self.done_bytes - self.last_bytes) / dt
             self.last_t = now
             self.last_bytes = self.done_bytes
-        self._render(now)
+        if self.tty or now >= self.next_nontty:
+            self._render(now)
+            if not self.tty:
+                self.next_nontty = now + self.NON_TTY_INTERVAL
 
     def _pct(self):
         if self.total_files:
@@ -676,7 +685,9 @@ class _Progress:
         pct_txt = f"{pct * 100:5.1f}%"
         count = (f"{self.done_files:,}/{self.total_files:,}" if self.total_files
                  else f"{_fmt_bytes(self.done_bytes)}/{_fmt_bytes(self.total_bytes)}")
-        line = (f"\r{self.desc} |{bar}| {pct_txt} | {count} | "
+        # In a TTY we rewrite the same line (`\r`); otherwise emit a discrete line.
+        sep = "\r" if self.tty else "\n"
+        line = (f"{sep}{self.desc} |{bar}| {pct_txt} | {count} | "
                 f"{_fmt_bytes(self.done_bytes)}{speed}{eta}")
         sys.stderr.write(line)
         sys.stderr.flush()
