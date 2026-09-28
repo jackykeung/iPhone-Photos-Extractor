@@ -12,6 +12,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.3.0] — 2026-09-28
+
+### Added
+- **Interactive mode ("run with no arguments").** `python3 iphone_photos_extractor.py` with no
+  `--backup` (on a TTY) now walks you through an on-screen wizard instead of erroring out:
+  1. **Discovers** your Finder/iTunes backups in the default `MobileSync/Backup` folder.
+  2. **Numbered selector with friendly device names** (e.g. "Stanley's iPhone", model, last-backup
+     date, approx. size) — **locked/encrypted backups are listed but can't be selected**. If there is
+     exactly one unlocked backup it is auto-selected.
+  3. **Suggests an output folder** in your home dir (`~/Pictures/iPhone/<device name>/`) — accept or
+     type another.
+  4. Asks a few **options** (date format, albums, deleted-photo recovery, date prefix).
+  5. **Previews** a dry-run summary (file count, size, folder breakdown) then **confirms** before
+     copying.
+- **Backup discovery helpers** — `find_backups()`, `load_backup_info()` (reads `Info.plist` /
+  `Manifest.plist` via `plistlib` for device name, model, serial, last-backup date, encryption state,
+  and an approximate size), `sanitize_folder()`, `suggest_output()`, `default_backup_dir()`.
+- **Prompt helpers** — `prompt_pick_backup()` (lock-blocking, duplicate-name disambiguation,
+  single-unlocked auto-select), `prompt_output()`, `prompt_yes_no()`, `_read()` (Ctrl+C/Ctrl+D safe),
+  `interactive_main()`. All **stdlib-only** (no third-party dependency).
+- **`--interactive` / `--non-interactive`** — force the wizard even with `--backup`, or disable the
+  auto wizard for scripts/CI.
+
+### Changed
+- **`--backup` is no longer required** — omitting it (on a TTY) triggers the interactive wizard;
+  `--non-interactive` still requires it.
+- **Tests** for discovery, lock-blocking, autoselect, abort paths, prompts, and the full wizard
+  flow — **151 tests, 100% line + branch coverage**.
+
+---
+
 ## [v1.2.0] — 2026-09-28
 
 ### Added

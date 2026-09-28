@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-iPhone Photos & Videos Extractor  v1.2.0
+iPhone Photos & Videos Extractor  v1.3.0
 ========================================
 Extract photos/videos from an UNENCRYPTED Apple iPhone (Finder/iTunes) backup,
 preserving original filenames, real creation/modification dates, and EXIF —
@@ -32,6 +32,11 @@ What it does / improves over the original extractor:
     sibling's timestamp (e.g. the .mov of a HEIC+MOV Live Photo) so it is
     classified into the correct year-month folder instead of No_Date. This is
     on by default; disable with --no-infer-sibling-date.
+  * INTERACTIVE mode: run with no --backup (or --interactive) and it discovers
+    your Finder/iTunes backups, shows friendly device names + model + last-
+    backup date (locked/encrypted devices are shown but can't be selected),
+    suggests an output folder inside your home dir, gives a dry-run preview,
+    and confirms before it copies. stdlib-only numbered prompts.
 
 Usage
 -----
@@ -49,6 +54,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import os
+import plistlib
 import re
 import sqlite3
 import stat
@@ -791,8 +797,12 @@ def main_with_args(argv=None):
     Returns the parsed ``args`` on success; raises SystemExit on error. Kept
     separate from ``main()`` so tests can invoke it directly."""
     ap = argparse.ArgumentParser(description="Extract iPhone photos/videos from an unencrypted backup, preserving names, dates, and metadata.")
-    ap.add_argument("--backup", required=True, help="iOS backup dir (contains Manifest.db)")
+    ap.add_argument("--backup", default=None, help="iOS backup dir (contains Manifest.db); omit for interactive mode")
     ap.add_argument("-o", "--output", default=None, help="Output directory (required unless --dry-run)")
+    ap.add_argument("--interactive", action="store_true",
+                    help="Force the interactive backup selector even if --backup is given")
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="Disable the auto interactive wizard (for scripts/CI)")
     ap.add_argument("--format", choices=["ym", "ymd", "flat"], default="ym", help="Date-based folder structure (default ym)")
     ap.add_argument("--since", default=None, help="Only files since DATE (YYYY-MM-DD, last-week, last-month)")
     ap.add_argument("--type", choices=["photo", "video", "audio", "all"], default="all")
@@ -808,6 +818,11 @@ def main_with_args(argv=None):
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--dry-run", action="store_true", help="Scan and report only")
     args = ap.parse_args(argv)
+
+    if args.backup is None:
+        print("ERROR: --backup is required (or run without any argument to use interactive mode).",
+              file=sys.stderr)
+        sys.exit(1)
 
     backup_dir = Path(args.backup).expanduser()
     if not backup_dir.is_dir():
@@ -992,8 +1007,304 @@ def main_with_args(argv=None):
 
 
 def main():
-    """Entry point (CLI)."""
-    main_with_args(sys.argv[1:])
+    """Entry point (CLI).
+
+    Runs the normal CLI. If ``--backup`` is omitted (and stdin is a TTY, i.e. a
+    human), or ``--interactive`` is given, it launches the interactive wizard to
+    pick a backup and output folder. ``--non-interactive`` disables that for
+    scripts/CI and requires ``--backup``.
+    """
+    argv = sys.argv[1:]
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--backup", default=None)
+    probe.add_argument("--interactive", action="store_true")
+    probe.add_argument("--non-interactive", action="store_true")
+    known, _ = probe.parse_known_args(argv)
+    if known.non_interactive:
+        main_with_args(argv)
+    elif known.interactive or (known.backup is None and sys.stdin.isatty()):
+        interactive_main(argv)
+    else:
+        main_with_args(argv)
+
+
+# ---------------------------------------------------------------------------
+# Interactive backup selector ("run with no arguments")
+# ---------------------------------------------------------------------------
+
+def default_backup_dir():
+    """The macOS Finder/iTunes default backup location."""
+    return Path.home() / "Library" / "Application Support" / "MobileSync" / "Backup"
+
+
+def _tree_size(dirpath):
+    """Recursive byte size of a directory tree (best-effort)."""
+    total = 0
+    try:
+        for entry in Path(dirpath).rglob("*"):
+            if entry.is_file():
+                total += entry.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def load_backup_info(backup_dir):
+    """Read a device's ``Info.plist`` + ``Manifest.plist`` into a flat dict.
+
+    Returns ``None`` if there's no usable ``Manifest.db`` (e.g. a stray folder).
+    Keys: ``dir``, ``name``, ``model``, ``serial``, ``last_backup`` (datetime or
+    None), ``encrypted`` (bool), ``payloads`` (int, best-effort), ``size``
+    (approx. bytes, best-effort).
+    """
+    backup_dir = Path(backup_dir)
+    if not (backup_dir / "Manifest.db").is_file():
+        return None
+    info, man = {}, {}
+    try:
+        info = plistlib.loads((backup_dir / "Info.plist").read_bytes())
+    except Exception:
+        info = {}
+    try:
+        man = plistlib.loads((backup_dir / "Manifest.plist").read_bytes())
+    except Exception:
+        man = {}
+    name = info.get("Device Name") or info.get("Display Name") or info.get("Product Name")
+    model = info.get("Product Name") or info.get("Product Type") or "iPhone"
+    serial = info.get("Serial Number") or ""
+    last = info.get("Last Backup Date")
+    encrypted = bool(man.get("IsEncrypted", False))
+    size = 0
+    try:
+        for d in os.listdir(backup_dir):
+            if len(d) >= 2 and (backup_dir / d[:2]).is_dir():
+                size += _tree_size(backup_dir / d[:2])
+    except OSError:
+        size = 0
+    return {
+        "dir": backup_dir,
+        "name": name or "Unnamed Device",
+        "model": model,
+        "serial": serial,
+        "last_backup": last,
+        "encrypted": encrypted,
+        "size": size,
+    }
+
+
+def find_backups(base=None):
+    """Discover backups under ``base`` (default ``default_backup_dir()``).
+
+    Returns a list of backup-info dicts sorted newest-last-backup first. A
+    sub-folder that isn't a backup is silently skipped.
+    """
+    base = Path(base) if base else default_backup_dir()
+    if not base.is_dir():
+        return []
+    out = []
+    for entry in base.iterdir():
+        if not entry.is_dir():
+            continue
+        info = load_backup_info(entry)
+        if info is not None:
+            out.append(info)
+    out.sort(key=lambda b: (b["last_backup"] is None, b["last_backup"]), reverse=True)
+    return out
+
+
+def sanitize_folder(name):
+    """Turn a device/display name into a safe filesystem folder name."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
+    slug = slug.strip("._").strip()
+    if not slug:
+        slug = "iPhone_Photos"
+    return slug
+
+
+def suggest_output(backup):
+    """Suggested output dir: ``~/Pictures/iPhone/<device name>/``."""
+    return Path.home() / "Pictures" / "iPhone" / sanitize_folder(backup.get("name", ""))
+
+
+def _read(prompt):
+    """Safe ``input()`` that returns ``None`` on EOF/Ctrl+C."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _fmt_date(dt):
+    if not dt:
+        return "unknown"
+    return f"{dt:%Y-%m-%d %H:%M}"
+
+
+def prompt_pick_backup(backups):
+    """Numbered menu to pick an unlocked backup.
+
+    Locked (encrypted) entries are shown with a padlock but can't be selected.
+    Returns the chosen backup dict, or ``None`` if the user aborted. If there is
+    exactly ONE unlocked backup it is auto-selected (no menu shown).
+    """
+    if not backups:
+        print("No backups found.")
+        return None
+    unlocked = [b for b in backups if not b["encrypted"]]
+    if len(unlocked) == 1:
+        return unlocked[0]
+    if not unlocked:
+        print("All discovered backups are encrypted. Re-create the backup in Finder "
+              "without 'Encrypt local backup' and try again.")
+        return None
+    # Disambiguate repeated display names by appending the model.
+    counts = {}
+    for b in backups:
+        counts[b["name"]] = counts.get(b["name"], 0) + 1
+    print("\nChoose a backup:")
+    for idx, b in enumerate(backups, 1):
+        nm = b["name"]
+        disambiguated = counts[nm] > 1
+        if disambiguated:
+            nm = f"{nm} ({b['model']})"
+        lock = "  [locked - encrypted]" if b["encrypted"] else ""
+        detail = f"  last backup {_fmt_date(b['last_backup'])}; ~{_fmt_bytes(b['size'])}"
+        print(f"{idx:>2}. {nm}{lock}{detail}")
+    while True:
+        raw = _read("Select a backup by number (or Enter to abort): ")
+        if not raw or raw.strip() == "":
+            return None
+        try:
+            choice = int(raw.strip())
+        except ValueError:
+            print("  Please enter a number.")
+            continue
+        match = next((b for n, b in enumerate(backups, 1) if n == choice), None)
+        if match is None:
+            print("  Invalid choice.")
+            continue
+        if match["encrypted"]:
+            print(f"  {match['name']} is encrypted and cannot be selected.")
+            continue
+        return match
+
+
+def prompt_output(suggestion):
+    """Confirm or replace the output dir. Returns a Path or None on abort."""
+    print(f"\nDefault output folder: {suggestion}")
+    raw = _read("Press Enter to accept, or type a different path: ")
+    if raw is None:
+        return None
+    if raw.strip() == "":
+        return suggestion
+    return Path(raw.strip()).expanduser()
+
+
+def prompt_yes_no(prompt, default="yes"):
+    """Yes/no prompt. Returns True/False (or the default on empty input)."""
+    suffix = "(Y/n)" if default == "yes" else "(y/N)"
+    raw = _read(f"{prompt} {suffix} ")
+    if raw is None:
+        return default == "yes"
+    raw = raw.strip().lower()
+    if raw == "":
+        return default == "yes"
+    return raw in ("y", "yes")
+
+
+def interactive_main(argv):
+    """The interactive wizard. Resolves a backup + output folder (and a few
+    options), shows a dry-run preview, then asks to extract.
+
+    ``argv`` is the original CLI list; any ``--backup``/``-o``/option flags the
+    user already passed are left intact. This never returns normally on success
+    (the underlying extraction exits); it returns only when the user aborts.
+    """
+    # Extract the flags the user may have already supplied so we don't override.
+    present = set()
+    for a in argv:
+        if a.startswith("--"):
+            present.add(a.split("=")[0])
+        elif a.startswith("-"):
+            present.add(a)
+    base = None
+    for idx, a in enumerate(argv):
+        if a.startswith("--backup="):
+            base = a.split("=", 1)[1]
+        elif a == "--backup" and idx + 1 < len(argv):
+            base = argv[idx + 1]
+    if base:
+        backup_dir = Path(base).expanduser()
+    else:
+        backups = find_backups()
+        if not backups:
+            print("No iPhone/iPad backups found under " + str(default_backup_dir()))
+            print("Connect & back up your iPhone with Finder or iTunes, then re-run.")
+            return
+        sel = prompt_pick_backup(backups)
+        if sel is None:
+            return
+        backup_dir = sel["dir"]
+
+    # Output folder: honor an existing -o, else suggest + confirm.
+    out = None
+    for a in argv:
+        if a in ("-o", "--output"):
+            out = argv[argv.index(a) + 1] if argv.index(a) + 1 < len(argv) else None
+        elif a.startswith("-o") and len(a) > 2 and not a.startswith("--"):
+            out = a[2:]
+        elif a.startswith("--output="):
+            out = a.split("=", 1)[1]
+    if out is None:
+        info = load_backup_info(backup_dir) or {}
+        suggestion = suggest_output(info)
+        chosen = prompt_output(suggestion)
+        if chosen is None:
+            return
+        out = str(chosen)
+
+    # Build a fresh argv: keep everything except --backup/-o (replaced), and
+    # append any options the wizard collected that weren't already given.
+    cleaned = []
+    skip_next = False
+    for idx, a in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("-o", "--output"):
+            skip_next = True
+            continue
+        if (a.startswith("-o") and not a.startswith("--") and a != "-o") \
+                or a.startswith("--output="):
+            continue
+        cleaned.append(a)
+    cleaned += ["--backup", str(backup_dir), "-o", str(out)]
+
+    extra = []
+    if "--format" not in present:
+        fmt = _read("Output format? [ym/ymd/flat] (Enter=ym): ")
+        fmt = (fmt or "ym").strip().lower()
+        if fmt in ("ymd", "flat"):
+            extra.append(f"--format={fmt}")
+    if "--albums" not in present and prompt_yes_no("Organize into your photo albums?", "no"):
+        extra.append("--albums")
+    if "--add-trash" not in present and prompt_yes_no("Also recover deleted photos?", "no"):
+        extra.append("--add-trash")
+    if "--prepend-date" not in present and prompt_yes_no("Prefix filenames with the date?", "no"):
+        extra.append("--prepend-date")
+    cleaned += extra
+
+    print()
+    try:
+        main_with_args(cleaned + ["--dry-run"])
+    except SystemExit as e:
+        if e.code not in (0, None):
+            return
+    if not prompt_yes_no("Extract now?", "yes"):
+        print("Cancelled — nothing was copied.")
+        return
+    main_with_args(cleaned)
 
 
 def _summarize(plan):

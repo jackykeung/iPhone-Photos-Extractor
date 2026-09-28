@@ -48,6 +48,11 @@ file's real Birth & LastModified timestamps**. That's exactly what this does.
 ## Usage
 
 ```bash
+# Interactive: no arguments — it discovers your backups, lets you pick one
+# (locked/encrypted devices are shown but can't be selected), suggests an output
+# folder, previews, and confirms before copying.
+python3 iphone_photos_extractor.py
+
 # Scan only (no files copied)
 python3 iphone_photos_extractor.py --backup ~/Library/Application\ Support/MobileSync/Backup/<DEVICE> --dry-run
 
@@ -71,8 +76,10 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 
 | Flag | Description |
 |---|---|
-| `--backup <dir>` | iOS backup directory (contains `Manifest.db`) — **required** |
-| `-o, --output <dir>` | Output directory — **required unless `--dry-run`** |
+| `--backup <dir>` | iOS backup directory (contains `Manifest.db`) — omit to use interactive mode |
+| `-o, --output <dir>` | Output directory — **required unless `--dry-run`** (or interactive mode) |
+| `--interactive` | Force the interactive backup selector even if `--backup` is given |
+| `--non-interactive` | Disable the auto interactive wizard (for scripts/CI) |
 | `--format {ym,ymd,flat}` | Folder structure by date (default `ym`) |
 | `--since <date>` | Only files since `YYYY-MM-DD`, `last-week`, or `last-month` |
 | `--type {photo,video,audio,all}` | Filter by media type (default `all`) |
@@ -85,6 +92,24 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 | `--dedupe` | Skip identical content (SHA-256, race-safe) |
 | `--workers N` | Parallel copy workers (default: CPU count) |
 | `--dry-run` | Scan and report only, copy nothing |
+
+### Interactive mode (run with no arguments)
+
+`python3 iphone_photos_extractor.py` with **no `--backup`** (and a real terminal) launches an
+on-screen wizard:
+
+1. **Discovers** your Finder/iTunes backups in the default `MobileSync/Backup` folder.
+2. Shows a **numbered selector with friendly device names** (e.g. "Stanley's iPhone", model, last
+   backup date) — **locked/encrypted backups are listed but can't be selected**. If there's exactly
+   one unlocked backup it's picked automatically.
+3. **Suggests an output folder** in your home dir (`~/Pictures/iPhone/<device name>/`) — accept or
+   type another.
+4. Asks a few **options** (date format, albums, deleted recovery, date prefix).
+5. **Previews** a dry-run summary (file count, size, folder breakdown), then **confirms** before
+   copying.
+
+`--interactive` forces the wizard even when `--backup` is given; `--non-interactive` turns it off
+(required for scripts/CI). The wizard is **stdlib-only** (plain prompt menus).
 
 ---
 
@@ -109,7 +134,13 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 ## Changelog
 
 The full, dated, versioned release history lives in **[CHANGELOG.md](CHANGELOG.md)** (Keep a
-Changelog / SemVer). The current release is **v1.2.0**.
+Changelog / SemVer). The current release is **v1.3.0**.
+
+### v1.3.0
+- **Interactive mode** — run with no arguments: it discovers your backups, shows **friendly device
+  names** (locked/encrypted ones can't be selected), suggests an output folder
+  (`~/Pictures/iPhone/<device>`), previews, and confirms before copying. `--interactive` forces it;
+  `--non-interactive` disables it. `--backup` is no longer required.
 
 ### v1.2.0
 - **Live-Photo (HEIC/MOV) sibling-date pairing** — an asset with no usable date now inherits the

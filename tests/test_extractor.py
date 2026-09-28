@@ -7,6 +7,7 @@ Run with:
 """
 
 import os
+import plistlib
 import struct
 import sqlite3
 import stat
@@ -1222,3 +1223,388 @@ def test_main_guard(backup, monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         runpy.run_path("iphone_photos_extractor.py", run_name="__main__")
     assert e.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# Interactive backup selector (v1.3.0)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def multi_backup(tmp_path):
+    return Path(mf.build_multi_backup_fixture(tmp_path))
+
+
+def test_find_backups_discovers_and_sorts(multi_backup):
+    got = p.find_backups(multi_backup)
+    names = [b["name"] for b in got]
+    # three backups; newest last-backup is first.
+    assert len(got) == 3
+    assert names[0] == "Stanley\u2019s iPhone"   # 2026-09-27 (dev-CCC)
+    assert names[1] == "Stanley\u2019s iPhone"   # 2026-04-27 (dev-AAA)
+    assert names[2] == "Amy Yeung"               # 2025-10-23 (dev-BBB)
+    assert got[2]["encrypted"] is True
+    assert got[0]["encrypted"] is False
+    assert got[0]["model"] == "iPhone 15 Pro Max"
+
+
+def test_find_backups_missing_dir(tmp_path):
+    assert p.find_backups(tmp_path / "nope") == []
+
+
+def test_find_backups_skips_non_backup(tmp_path):
+    (tmp_path / "not-a-backup").mkdir()
+    assert p.find_backups(tmp_path) == []
+
+
+def test_load_backup_info_requires_manifest(tmp_path):
+    (tmp_path / "Info.plist").write_bytes(b"x")
+    assert p.load_backup_info(tmp_path) is None
+
+
+def test_load_backup_info_reads_fields(multi_backup):
+    dev = p.find_backups(multi_backup)[2]
+    assert dev["name"] == "Amy Yeung"
+    assert dev["serial"] == "BBB222"
+    assert dev["encrypted"] is True
+    assert dev["last_backup"].year == 2025
+
+
+def test_sanitize_folder():
+    assert p.sanitize_folder("Stanley\u2019s iPhone") == "Stanley_s_iPhone"
+    assert p.sanitize_folder("iPhone 15 ProMax") == "iPhone_15_ProMax"
+    assert p.sanitize_folder("a/b:c") == "a_b_c"
+    assert p.sanitize_folder("!!!") == "iPhone_Photos"  # empty fallback
+
+
+def test_suggest_output(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: fake_home))
+    out = p.suggest_output({"name": "Stanley\u2019s iPhone"})
+    assert out == fake_home / "Pictures" / "iPhone" / "Stanley_s_iPhone"
+
+
+def test_prompt_pick_backup_auto_single_unlocked(monkeypatch, tmp_path):
+    # Only ONE unlocked backup -> auto-selected without a prompt.
+    mf.make_selector_backup(tmp_path, name="Alone", model="iPhone",
+                            encrypted=False)
+    mf.make_selector_backup(tmp_path, name="Locked", model="iPhone",
+                            encrypted=True)
+    monkeypatch.setattr("builtins.input",
+                        lambda _: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    sel = p.prompt_pick_backup(p.find_backups(tmp_path))
+    assert sel["name"] == "Alone"
+    assert sel["encrypted"] is False
+
+
+def test_prompt_pick_backup_menu_blocks_locked(multi_backup, monkeypatch, capsys):
+    inputs = iter(["3", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    sel = p.prompt_pick_backup(p.find_backups(multi_backup))
+    assert sel is None
+    assert "Amy Yeung is encrypted and cannot be selected" in capsys.readouterr().out
+
+
+def test_prompt_pick_backup_choose_unlocked(multi_backup, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "1")
+    sel = p.prompt_pick_backup(p.find_backups(multi_backup))
+    assert sel is not None
+    assert sel["encrypted"] is False
+    assert sel["model"] == "iPhone 15 Pro Max"
+
+
+def test_prompt_pick_backup_invalid_then_valid(multi_backup, monkeypatch):
+    inputs = iter(["zz", "2"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    sel = p.prompt_pick_backup(p.find_backups(multi_backup))
+    assert sel["model"] == "iPhone 12 Pro Max"
+
+
+def test_prompt_pick_backup_abort(multi_backup, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert p.prompt_pick_backup(p.find_backups(multi_backup)) is None
+
+
+def test_prompt_pick_backup_all_locked(monkeypatch, tmp_path, capsys):
+    mf.make_selector_backup(tmp_path, name="Locked1", model="iPhone", encrypted=True)
+    mf.make_selector_backup(tmp_path, name="Locked2", model="iPhone", encrypted=True)
+    got = p.find_backups(tmp_path)
+    assert len(got) == 2
+    assert p.prompt_pick_backup(got) is None
+    assert "All discovered backups are encrypted" in capsys.readouterr().out
+
+
+def test_prompt_output_accept_default(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert p.prompt_output(Path("/a/b")) == Path("/a/b")
+
+
+def test_prompt_output_custom(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "/custom/out")
+    assert p.prompt_output(Path("/a/b")) == Path("/custom/out").expanduser()
+
+
+def test_prompt_yes_no(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    assert p.prompt_yes_no("?") is True
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert p.prompt_yes_no("?") is False
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert p.prompt_yes_no("?", default="no") is False
+
+
+def test_interactive_main_no_backups(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    # No input needed; returns None on no backups.
+    assert p.interactive_main([]) is None
+    assert "No iPhone/iPad backups found" in capsys.readouterr().out
+
+
+def test_interactive_main_roundtrip(monkeypatch, multi_backup, tmp_path):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(p, "default_backup_dir", lambda: multi_backup)
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: fake_home))
+    # pick backup #1 (newest unlocked Stanley iPhone 15), accept output,
+    # format=ym, no albums, no trash, no prepend-date, then extract now.
+    inputs = iter(["1", "", "", "n", "n", "n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main([])
+    # output folder is inside the fake home; files were extracted.
+    out = fake_home / "Pictures" / "iPhone" / "Stanley_s_iPhone"
+    assert out.is_dir()
+    assert list(out.rglob("IMG_0001*"))
+
+
+def test_interactive_main_cancel_at_confirm(monkeypatch, multi_backup, tmp_path):
+    monkeypatch.setattr(p, "default_backup_dir", lambda: multi_backup)
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    inputs = iter(["1", "", "", "n", "n", "n", "n"])  # last: don't extract
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main([])
+    # no extraction occurred (cancelled before copy)
+    assert not (tmp_path / "home" / "Pictures").exists()
+
+
+def test_main_noninteractive_requires_backup(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["prog", "--non-interactive"])
+    with pytest.raises(SystemExit) as e:
+        p.main()
+    assert e.value.code == 1
+
+
+def test_main_interactive_flag_forces_wizard(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    monkeypatch.setattr(sys, "argv", ["prog", "--interactive"])
+    # --interactive skips the TTY gate; no backups -> returns cleanly.
+    p.main()
+    assert "No iPhone/iPad backups found" in capsys.readouterr().out
+
+
+def test_main_auto_wizard_on_missing_backup(monkeypatch, tmp_path, capsys):
+    import types
+    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    monkeypatch.setattr(sys, "argv", ["prog"])  # no --backup, no --non-interactive
+    # Pretend stdin is a TTY so the auto-wizard triggers.
+    monkeypatch.setattr(p.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    p.main()
+    assert "No iPhone/iPad backups found" in capsys.readouterr().out
+
+
+def test_main_uses_normal_path_with_backup(monkeypatch, backup, capsys):
+    monkeypatch.setattr(sys, "argv", ["prog", "--backup", str(backup), "--dry-run"])
+    with pytest.raises(SystemExit) as e:
+        p.main()
+    assert e.value.code == 0
+    assert "DRY-RUN" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Extra coverage for interactive helpers (v1.3.0)
+# ---------------------------------------------------------------------------
+
+def test_load_backup_info_corrupt_plists(tmp_path):
+    # Present Manifest.db but unreadable/invalid plists -> fall back to unnamed.
+    (tmp_path / "Manifest.db").touch()
+    (tmp_path / "Info.plist").write_bytes(b"not a plist")
+    (tmp_path / "Manifest.plist").write_bytes(b"nope")
+    info = p.load_backup_info(tmp_path)
+    assert info is not None
+    assert info["name"] == "Unnamed Device"
+    assert info["model"] == "iPhone"
+    assert info["encrypted"] is False
+    assert info["serial"] == ""
+
+
+def test_load_backup_info_size_zero_when_no_subdirs(tmp_path):
+    (tmp_path / "Manifest.db").touch()
+    (tmp_path / "Info.plist").write_bytes(plistlib.dumps({"Device Name": "X"}))
+    (tmp_path / "Manifest.plist").write_bytes(plistlib.dumps({"IsEncrypted": False}))
+    info = p.load_backup_info(tmp_path)
+    assert info["size"] == 0
+
+
+def test_read_returns_none_on_eof(monkeypatch):
+    def boom(_):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", boom)
+    assert p._read("?") is None
+
+
+def test_read_returns_none_on_keyboard_interrupt(monkeypatch):
+    def boom(_):
+        raise KeyboardInterrupt
+    monkeypatch.setattr("builtins.input", boom)
+    assert p._read("?") is None
+
+
+def test_prompt_pick_backup_no_backups(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(AssertionError))
+    assert p.prompt_pick_backup([]) is None
+    assert "No backups found." in capsys.readouterr().out
+
+
+def test_prompt_output_abort_on_eof(monkeypatch):
+    def boom(_):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", boom)
+    assert p.prompt_output(Path("/a/b")) is None
+
+
+def test_prompt_yes_no_eof_default(monkeypatch):
+    def boom(_):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", boom)
+    assert p.prompt_yes_no("?", default="yes") is True
+    assert p.prompt_yes_no("?", default="no") is False
+
+
+def test_interactive_main_with_backup_and_output(monkeypatch, backup, tmp_path):
+    # --backup and -o supplied -> no discovery/prompting for them.
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    inputs = iter(["", "n", "n", "n", "y"])   # format default, no albums/trash/prepend, extract
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), "-o", str(out)])
+    assert list(out.rglob("IMG_0001*"))
+
+
+def test_interactive_main_format_flat(monkeypatch, backup, tmp_path):
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    inputs = iter(["flat", "n", "n", "n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), "-o", str(out)])
+    # flat puts files at the top level, not in a YYYY-MM subfolder.
+    assert list(out.glob("IMG_0001*"))
+
+
+def test_interactive_main_present_flags_skip_prompts(monkeypatch, backup, tmp_path):
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    # All option flags already present -> no prompting for them.
+    inputs = iter(["y"])  # only the "Extract now?" confirm remains
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), "-o", str(out),
+                        "--format=flat", "--albums", "--add-trash", "--prepend-date"])
+    assert any(out.rglob("*.*"))  # files were copied (into album/flat folders)
+
+
+def test_interactive_main_aborts_at_output_none(monkeypatch, multi_backup, tmp_path):
+    monkeypatch.setattr(p, "default_backup_dir", lambda: multi_backup)
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    # Choose backup #1, then EOF on the output prompt -> abort.
+    monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(EOFError))
+    assert p.interactive_main([]) is None
+
+
+def test_default_backup_dir():
+    from pathlib import Path as _P
+    assert p.default_backup_dir() == _P.home() / "Library" / "Application Support" / "MobileSync" / "Backup"
+
+
+def test_find_backups_skips_plain_file(tmp_path):
+    (tmp_path / "a-file.txt").touch()          # not a dir -> skipped
+    mf.make_selector_backup(tmp_path, name="RealDevice", encrypted=False)
+    got = p.find_backups(tmp_path)
+    assert [b["name"] for b in got] == ["RealDevice"]
+
+
+def test_fmt_date_unknown():
+    assert p._fmt_date(None) == "unknown"
+
+
+def test_prompt_pick_backup_chosen_out_of_range(multi_backup, monkeypatch):
+    inputs = iter(["99", "1"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    sel = p.prompt_pick_backup(p.find_backups(multi_backup))
+    assert sel is not None  # invalid then valid
+
+
+def test_load_backup_info_size_exception(monkeypatch, tmp_path):
+    (tmp_path / "Manifest.db").touch()
+    (tmp_path / "Info.plist").write_bytes(plistlib.dumps({"Device Name": "X"}))
+    (tmp_path / "Manifest.plist").write_bytes(plistlib.dumps({"IsEncrypted": False}))
+    monkeypatch.setattr(p.os, "listdir", lambda _: (_ for _ in ()).throw(OSError("boom")))
+    assert p.load_backup_info(tmp_path)["size"] == 0
+
+
+def test_tree_size_exception(monkeypatch, tmp_path):
+    (tmp_path / "a").mkdir()
+    monkeypatch.setattr(p.Path, "rglob",
+                        lambda self, _: (_ for _ in ()).throw(OSError("boom")))
+    assert p._tree_size(tmp_path) == 0
+
+
+def test_tree_size_recursive(tmp_path):
+    # A nested directory (is_file() False branch) is walked, not just files.
+    (tmp_path / "aa" / "nested").mkdir(parents=True)
+    (tmp_path / "aa" / "nested" / "a.bin").write_bytes(b"1234567890")
+    (tmp_path / "aa" / "b.bin").write_bytes(b"12345")
+    assert p._tree_size(tmp_path) == 15
+
+
+def test_interactive_main_backup_equals_form_and_o_abort(monkeypatch, backup, tmp_path):
+    # --backup=<path> (equals form) with NO -o -> hits out-scan else, then
+    # the output prompt aborts on EOF -> return None (line 1255).
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    def boom(_):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", boom)
+    assert p.interactive_main([f"--backup={backup}"]) is None
+
+
+def test_interactive_main_compact_o_and_output_equals(monkeypatch, backup, tmp_path):
+    # --backup (space) + -o<path> (compact) -> out-scan line 1247 + cleaning 1269.
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    inputs = iter(["", "n", "n", "n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), f"-o{out}"])
+    assert list(out.rglob("IMG_0001*"))
+
+
+def test_interactive_main_output_equals_form(monkeypatch, backup, tmp_path):
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    inputs = iter(["", "n", "n", "n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), f"--output={out}"])
+    assert list(out.rglob("IMG_0001*"))
+
+
+def test_interactive_main_yes_options(monkeypatch, backup, tmp_path):
+    out = tmp_path / "out"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    # format default, then yes to albums / trash / prepend, then extract.
+    inputs = iter(["", "y", "y", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--backup", str(backup), "-o", str(out)])
+    assert any(out.rglob("*.*"))
+
+
+def test_interactive_main_dry_run_failure_returns(monkeypatch, tmp_path):
+    # A bad --backup leads main_with_args(--dry-run) to exit non-zero -> return.
+    # Pre-provision all option flags so no prompt intervenes before the dry-run.
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(AssertionError))
+    assert p.interactive_main(["--backup", str(tmp_path / "nope"), "-o", str(tmp_path / "o"),
+                               "--format=ym", "--albums", "--add-trash", "--prepend-date"]) is None

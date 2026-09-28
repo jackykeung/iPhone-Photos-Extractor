@@ -23,6 +23,7 @@ can exercise every branch without touching a real 20 GB backup:
 """
 
 import os
+import plistlib
 import sqlite3
 import struct
 import sys
@@ -71,6 +72,39 @@ def _add_row(rows, domain, rel, bplist_blob):
     file_id = hashlib.sha1(f"{domain}|{rel}".encode()).hexdigest()
     rows.append((file_id, domain, rel, bplist_blob))
     return file_id
+
+
+def write_backup_plists(backup_dir, name="Test Device", model="iPhone Test",
+                        serial="TEST1234", last_backup=None, encrypted=False):
+    """Write ``Info.plist`` + ``Manifest.plist`` so ``find_backups()`` can read
+    a friendly device name and lock/encryption state. Used by the interactive
+    tests."""
+    backup_dir = Path(backup_dir)
+    info = {
+        "Device Name": name,
+        "Display Name": name,
+        "Product Name": model,
+        "Product Type": "iPhoneTest",
+        "Serial Number": serial,
+        "Last Backup Date": last_backup or datetime(2026, 1, 1, 12, 0, 0),
+    }
+    (backup_dir / "Info.plist").write_bytes(plistlib.dumps(info))
+    man = {"IsEncrypted": encrypted}
+    (backup_dir / "Manifest.plist").write_bytes(plistlib.dumps(man))
+
+
+def make_selector_backup(base, name="Test Device", model="iPhone Test",
+                         serial="TEST1234", encrypted=False):
+    """Create a discovery-visible backup (plists + a dummy ``Manifest.db``) that
+    is enough for the interactive *selector* to list/block it, without the full
+    media fixture."""
+    d = Path(base) / name
+    d.mkdir(parents=True, exist_ok=True)
+    write_backup_plists(d, name=name, model=model, serial=serial,
+                        encrypted=encrypted)
+    # find_backups() only needs Manifest.db to exist to treat this as a backup.
+    (d / "Manifest.db").touch()
+    return d
 
 
 def build_fixture(root=None, db_dir=None):
@@ -315,7 +349,37 @@ def build_fixture(root=None, db_dir=None):
     c.commit()
     c.close()
 
+    # Record a friendly device name + unlocked state so find_backups() works.
+    write_backup_plists(root, name="Stanley\u2019s iPhone", model="iPhone 12 Pro Max",
+                        serial="G6TF72ZJ0D5M", last_backup=datetime(2026, 4, 27, 12, 0, 0),
+                        encrypted=False)
+
     return root
+
+
+def build_multi_backup_fixture(base=None):
+    """Create a base dir holding several backups (some locked) for interactive
+    selector tests. Returns the base dir Path."""
+    import tempfile
+    if base is None:
+        base = tempfile.mkdtemp(prefix="iphone_photos_multifix_")
+    base = Path(base)
+    # A normal unlocked backup works as a real extractable one.
+    a = build_fixture(base / "dev-AAA")
+    write_backup_plists(a, name="Stanley\u2019s iPhone", model="iPhone 12 Pro Max",
+                        serial="AAA111", last_backup=datetime(2026, 4, 27, 12, 0, 0),
+                        encrypted=False)
+    # A locked (encrypted) backup that must not be selectable.
+    b = build_fixture(base / "dev-BBB")
+    write_backup_plists(b, name="Amy Yeung", model="iPhone 13 Pro Max",
+                        serial="BBB222", last_backup=datetime(2025, 10, 23, 12, 0, 0),
+                        encrypted=True)
+    # A second unlocked backup (used for duplicate-name disambiguation tests).
+    c = build_fixture(base / "dev-CCC")
+    write_backup_plists(c, name="Stanley\u2019s iPhone", model="iPhone 15 Pro Max",
+                        serial="CCC333", last_backup=datetime(2026, 9, 27, 12, 0, 0),
+                        encrypted=False)
+    return base
 
 
 if __name__ == "__main__":
