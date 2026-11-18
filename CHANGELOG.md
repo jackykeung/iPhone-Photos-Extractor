@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.3.1] — 2026-11-18
+
+### Fixed
+- **`--dry-run` no longer extracts.** The interactive wizard ran its preview, then asked
+  "Extract now?" and copied files even though `--dry-run` was supplied. `--dry-run` now scans and
+  stops; the flag is honoured in wizard mode as it already was on the plain CLI path. The wizard
+  also stops demanding an output folder when nothing will be copied.
+- **Clear message when macOS blocks the backup folder.** Reading `MobileSync/Backup` without Full
+  Disk Access raises `PermissionError: [Errno 1] Operation not permitted`, which previously crashed
+  with a traceback out of `find_backups()`. Discovery now treats an unreadable backup folder as
+  "none found", and the wizard distinguishes the two cases: a folder it cannot read reports the
+  privacy gate and how to lift it, rather than claiming no backups exist. Added
+  `backup_dir_readable()`.
+
+---
+
 ## [v1.3.0] — 2026-09-28
 
 ### Added

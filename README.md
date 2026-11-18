@@ -45,6 +45,32 @@ file's real Birth & LastModified timestamps**. That's exactly what this does.
 
 ---
 
+## Troubleshooting: "Operation not permitted"
+
+On modern macOS the backup folder sits behind **TCC** (Transparency, Consent, Control). A shell
+without Full Disk Access is refused by the OS:
+
+```
+Cannot read /Users/<you>/Library/Application Support/MobileSync/Backup
+
+macOS is blocking access to the backup folder (Operation not permitted).
+```
+
+This is a privacy gate, not a broken install and not a normal Unix permission problem. The
+diagnostic signature is distinctive: `stat` on the folder **succeeds** (metadata readable, owner
+correct, mode `drwxr-xr-x`) while listing it fails. A real permission problem would deny the `stat`
+too.
+
+**Fix:** System Settings > Privacy & Security > **Full Disk Access** > add the app you run the
+command from (Terminal, iTerm2, your IDE), then **fully quit and reopen that app** — the grant is
+captured at process launch, so a new tab in the running terminal will keep failing.
+
+The tool tells these two states apart deliberately. "No backups found" means the folder was read
+and held no backups; "Cannot read" means it was never readable. If you see the first when you know
+a backup exists, check Full Disk Access before anything else.
+
+---
+
 ## Usage
 
 ```bash
@@ -91,7 +117,7 @@ python3 iphone_photos_extractor.py --backup "<backup dir>" -o ~/Pictures/iPhone/
 | `--move` | Move files out of the backup (frees disk) instead of copy |
 | `--dedupe` | Skip identical content (SHA-256, race-safe) |
 | `--workers N` | Parallel copy workers (default: CPU count) |
-| `--dry-run` | Scan and report only, copy nothing |
+| `--dry-run` | Scan and report only — never copies, in the plain CLI **and** the interactive wizard; does not require `-o` |
 
 ### Interactive mode (run with no arguments)
 
@@ -134,7 +160,21 @@ on-screen wizard:
 ## Changelog
 
 The full, dated, versioned release history lives in **[CHANGELOG.md](CHANGELOG.md)** (Keep a
-Changelog / SemVer). The current release is **v1.3.0**.
+Changelog / SemVer). The current release is **v1.3.1**. Check the version of an installed copy with `python3 iphone_photos_extractor.py --version`.
+
+### v1.3.1
+- **`--dry-run` no longer extracts.** The interactive wizard ran its preview and then asked
+  "Extract now?", so a documented scan-only flag could copy files to disk on a default-yes prompt.
+  `--dry-run` now scans and stops, in wizard mode exactly as on the plain CLI path, and no longer
+  requires an output folder.
+- **Clear message when macOS blocks the backup folder.** Reading `MobileSync/Backup` without Full
+  Disk Access raised `PermissionError: [Errno 1] Operation not permitted` and crashed with a
+  traceback out of `find_backups()`. Discovery now treats an unreadable folder as "none found",
+  and the wizard distinguishes *empty* from *unreadable*, reporting the privacy gate and its fix
+  instead of telling you to connect a phone that is already backed up. New `backup_dir_readable()`
+  helper. See [Troubleshooting](#troubleshooting-operation-not-permitted).
+- **`--version`** flag, and a real `__version__` constant (previously the version lived only in the
+  module docstring).
 
 ### v1.3.0
 - **Interactive mode** — run with no arguments: it discovers your backups, shows **friendly device

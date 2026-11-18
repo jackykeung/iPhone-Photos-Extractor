@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-iPhone Photos & Videos Extractor  v1.3.0
+iPhone Photos & Videos Extractor  v1.3.1
 ========================================
 Extract photos/videos from an UNENCRYPTED Apple iPhone (Finder/iTunes) backup,
 preserving original filenames, real creation/modification dates, and EXIF —
@@ -49,6 +49,8 @@ Usage
 
 Author: built for Jacky Keung. MIT licensed.
 """
+
+__version__ = "1.3.1"
 
 import argparse
 import concurrent.futures
@@ -797,6 +799,7 @@ def main_with_args(argv=None):
     Returns the parsed ``args`` on success; raises SystemExit on error. Kept
     separate from ``main()`` so tests can invoke it directly."""
     ap = argparse.ArgumentParser(description="Extract iPhone photos/videos from an unencrypted backup, preserving names, dates, and metadata.")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--backup", default=None, help="iOS backup dir (contains Manifest.db); omit for interactive mode")
     ap.add_argument("-o", "--output", default=None, help="Output directory (required unless --dry-run)")
     ap.add_argument("--interactive", action="store_true",
@@ -1092,24 +1095,56 @@ def load_backup_info(backup_dir):
     }
 
 
+TCC_HINT = (
+    "macOS is blocking access to the backup folder (Operation not permitted).\n"
+    "This is the Full Disk Access privacy gate, not a normal permission error.\n"
+    "Fix: System Settings > Privacy & Security > Full Disk Access, add the app\n"
+    "you run this from (Terminal / iTerm / your IDE), then fully quit and reopen it."
+)
+
+
 def find_backups(base=None):
     """Discover backups under ``base`` (default ``default_backup_dir()``).
 
     Returns a list of backup-info dicts sorted newest-last-backup first. A
-    sub-folder that isn't a backup is silently skipped.
+    sub-folder that isn't a backup is silently skipped. A read error (including
+    macOS TCC ``Operation not permitted``) yields an empty list rather than a
+    traceback; use :func:`backup_dir_readable` to tell "none" from "blocked".
     """
     base = Path(base) if base else default_backup_dir()
     if not base.is_dir():
         return []
     out = []
-    for entry in base.iterdir():
-        if not entry.is_dir():
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
             continue
         info = load_backup_info(entry)
         if info is not None:
             out.append(info)
     out.sort(key=lambda b: (b["last_backup"] is None, b["last_backup"]), reverse=True)
     return out
+
+
+def backup_dir_readable(base=None):
+    """True if ``base`` exists and can be listed.
+
+    Returns ``False`` both when the folder is absent and when the OS refuses
+    to read it (macOS TCC denial surfaces as a plain ``PermissionError``).
+    """
+    base = Path(base) if base else default_backup_dir()
+    try:
+        with os.scandir(base) as it:
+            next(it, None)
+    except OSError:
+        return False
+    return True
 
 
 def sanitize_folder(name):
@@ -1239,8 +1274,13 @@ def interactive_main(argv):
     else:
         backups = find_backups()
         if not backups:
-            print("No iPhone/iPad backups found under " + str(default_backup_dir()))
-            print("Connect & back up your iPhone with Finder or iTunes, then re-run.")
+            if not backup_dir_readable():
+                print("Cannot read " + str(default_backup_dir()))
+                print()
+                print(TCC_HINT)
+            else:
+                print("No iPhone/iPad backups found under " + str(default_backup_dir()))
+                print("Connect & back up your iPhone with Finder or iTunes, then re-run.")
             return
         sel = prompt_pick_backup(backups)
         if sel is None:
@@ -1279,7 +1319,10 @@ def interactive_main(argv):
                 or a.startswith("--output="):
             continue
         cleaned.append(a)
-    cleaned += ["--backup", str(backup_dir), "-o", str(out)]
+    cleaned += ["--backup", str(backup_dir)]
+    # A dry run copies nothing, so no output dir is needed (or wanted).
+    if "--dry-run" not in present:
+        cleaned += ["-o", str(out)]
 
     extra = []
     if "--format" not in present:
@@ -1301,6 +1344,12 @@ def interactive_main(argv):
     except SystemExit as e:
         if e.code not in (0, None):
             return
+    # `--dry-run` means scan and report only. Never fall through to a copy,
+    # even though the preview above already ran: honour the flag the user gave.
+    if "--dry-run" in present:
+        print()
+        print("Dry run complete - nothing was copied.")
+        return
     if not prompt_yes_no("Extract now?", "yes"):
         print("Cancelled — nothing was copied.")
         return

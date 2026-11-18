@@ -1353,10 +1353,100 @@ def test_prompt_yes_no(monkeypatch):
 
 
 def test_interactive_main_no_backups(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    empty = tmp_path / "empty"
+    empty.mkdir()                          # readable, but no backups inside
+    monkeypatch.setattr(p, "default_backup_dir", lambda: empty)
     # No input needed; returns None on no backups.
     assert p.interactive_main([]) is None
     assert "No iPhone/iPad backups found" in capsys.readouterr().out
+
+
+def test_backup_dir_readable_true(tmp_path):
+    (tmp_path / "x").mkdir()
+    assert p.backup_dir_readable(tmp_path) is True
+
+
+def test_backup_dir_readable_missing(tmp_path):
+    assert p.backup_dir_readable(tmp_path / "nope") is False
+
+
+def test_backup_dir_readable_permission_denied(monkeypatch, tmp_path):
+    # macOS TCC denies reading the folder: scandir raises PermissionError.
+    def boom(_path):
+        raise PermissionError(1, "Operation not permitted", str(tmp_path))
+    monkeypatch.setattr(p.os, "scandir", boom)
+    assert p.backup_dir_readable(tmp_path) is False
+
+
+def test_find_backups_permission_denied_returns_empty(monkeypatch, tmp_path):
+    def boom(_path):
+        raise PermissionError(1, "Operation not permitted", str(tmp_path))
+    monkeypatch.setattr(p.os, "scandir", boom)
+    # Must not raise a traceback; the wizard reports the TCC hint instead.
+    assert p.find_backups(tmp_path) == []
+
+
+def test_find_backups_skips_entry_whose_isdir_raises(monkeypatch, tmp_path):
+    (tmp_path / "a").mkdir()
+    mf.make_selector_backup(tmp_path, name="RealDevice", encrypted=False)
+
+    real_is_dir = p.Path.is_dir
+
+    def selective(self):
+        if self.name == "a":
+            raise PermissionError(1, "Operation not permitted", str(self))
+        return real_is_dir(self)
+
+    monkeypatch.setattr(p.Path, "is_dir", selective)
+    assert [b["name"] for b in p.find_backups(tmp_path)] == ["RealDevice"]
+
+
+def test_interactive_main_reports_tcc_when_unreadable(monkeypatch, capsys):
+    monkeypatch.setattr(p, "default_backup_dir", lambda: Path("/denied/Backup"))
+    monkeypatch.setattr(p, "find_backups", lambda *_a, **_k: [])
+    monkeypatch.setattr(p, "backup_dir_readable", lambda *_a, **_k: False)
+    assert p.interactive_main([]) is None
+    out = capsys.readouterr().out
+    assert "Cannot read /denied/Backup" in out
+    assert "Full Disk Access" in out
+    assert "No iPhone/iPad backups found" not in out
+
+
+def test_interactive_main_dry_run_never_extracts(monkeypatch, multi_backup, tmp_path, capsys):
+    """--dry-run must scan and stop: no 'Extract now?' prompt, no copy."""
+    monkeypatch.setattr(p, "default_backup_dir", lambda: multi_backup)
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: fake_home))
+    # backup, output, format, albums, trash, prefix -- and then a "yes" that
+    # would extract if the guard were missing.
+    inputs = iter(["1", "", "", "n", "n", "n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--dry-run"])
+    out = capsys.readouterr().out
+    assert "Dry run complete" in out
+    assert "Extract now?" not in out
+    assert not list(fake_home.rglob("IMG_0001*"))
+
+
+def test_interactive_main_dry_run_passes_no_output_dir(monkeypatch, multi_backup, tmp_path):
+    """A dry run needs no -o, so the wizard must not force one."""
+    monkeypatch.setattr(p, "default_backup_dir", lambda: multi_backup)
+    monkeypatch.setattr(p.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    seen = []
+    real = p.main_with_args
+
+    def spy(argv):
+        seen.append(list(argv))
+        return real(argv)
+
+    monkeypatch.setattr(p, "main_with_args", spy)
+    inputs = iter(["1", "", "", "n", "n", "n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    p.interactive_main(["--dry-run"])
+    argv = seen[0]
+    assert "--dry-run" in argv
+    assert "-o" not in argv and "--output" not in argv
+    assert "--backup" in argv
 
 
 def test_interactive_main_roundtrip(monkeypatch, multi_backup, tmp_path):
@@ -1384,6 +1474,14 @@ def test_interactive_main_cancel_at_confirm(monkeypatch, multi_backup, tmp_path)
     assert not (tmp_path / "home" / "Pictures").exists()
 
 
+def test_version_constant_and_flag(capsys):
+    assert p.__version__ == "1.3.1"
+    with pytest.raises(SystemExit) as e:
+        p.main_with_args(["--version"])
+    assert e.value.code == 0
+    assert "1.3.1" in capsys.readouterr().out
+
+
 def test_main_noninteractive_requires_backup(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["prog", "--non-interactive"])
     with pytest.raises(SystemExit) as e:
@@ -1392,7 +1490,9 @@ def test_main_noninteractive_requires_backup(monkeypatch, capsys):
 
 
 def test_main_interactive_flag_forces_wizard(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    empty = tmp_path / "empty"
+    empty.mkdir()                          # readable, but no backups inside
+    monkeypatch.setattr(p, "default_backup_dir", lambda: empty)
     monkeypatch.setattr(sys, "argv", ["prog", "--interactive"])
     # --interactive skips the TTY gate; no backups -> returns cleanly.
     p.main()
@@ -1401,7 +1501,9 @@ def test_main_interactive_flag_forces_wizard(monkeypatch, tmp_path, capsys):
 
 def test_main_auto_wizard_on_missing_backup(monkeypatch, tmp_path, capsys):
     import types
-    monkeypatch.setattr(p, "default_backup_dir", lambda: tmp_path / "empty")
+    empty = tmp_path / "empty"
+    empty.mkdir()                          # readable, but no backups inside
+    monkeypatch.setattr(p, "default_backup_dir", lambda: empty)
     monkeypatch.setattr(sys, "argv", ["prog"])  # no --backup, no --non-interactive
     # Pretend stdin is a TTY so the auto-wizard triggers.
     monkeypatch.setattr(p.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
